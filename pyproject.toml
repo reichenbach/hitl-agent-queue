@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hitl-agent-queue"
+version = "0.1.0"
+description = "Human-in-the-loop work queue for coordinating coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Matt Reichenbach" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+hitl-queue = "hitl_queue.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

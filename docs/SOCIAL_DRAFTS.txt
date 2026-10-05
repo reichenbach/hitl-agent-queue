@@ -1,0 +1,27 @@
+# LinkedIn draft (personal profile) — needs Matt approve before post
+
+Plain text. No markdown. No em dashes.
+
+---
+
+Most multi-agent demos are chat relays. That is how you get silent stalls and three tools rewriting the same file.
+
+I open-sourced a small reference for the pattern I actually want in an AI workflow seat: a durable ticket board, role claims, a human gate on irreversible steps, and short progress pings when a stage completes.
+
+Cursor (or any draft worker) claims a ticket and attaches materials. You approve from your phone with a one-line grammar: APPROVE TKT-0001 CLAUDE or SKIP. Codex or Claude picks up a frozen packet. Silence means stuck, not success.
+
+Repo: https://github.com/reichenbach/hitl-agent-queue
+
+Synthetic demo only. Stdlib Python. Optional Cortland iMessage for the notify path.
+
+If you run internal automations with a human stop you can trust, this is the shape.
+
+---
+
+# X draft (@realcoachmatt23) — optional, shorter; needs Matt approve
+
+Agents do not need to DM each other. They need a ticket, a claim, a human gate, and a frozen handoff.
+
+Public reference: https://github.com/reichenbach/hitl-agent-queue
+
+Synthetic demo. Progress pings when a stage moves. Silence means stuck.
