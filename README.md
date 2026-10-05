@@ -11,8 +11,9 @@ private operator setup. It ships:
 
 - a status machine (`new → drafting → review → approved → handoff → done`)
 - role claims (`cursor-draft`, `claude`, `codex`, …)
-- a pluggable notifier (stdout by default; Cortland iMessage optional)
+- a pluggable notifier (stdout by default; Slack / Teams / Discord / webhook / Cortland optional)
 - reply grammar: `APPROVE TICKET-ID CODEX|CLAUDE` / `SKIP TICKET-ID`
+- optional reply server for Slack slash commands and Teams/Zapier ingress
 - a synthetic end-to-end demo you can run locally
 
 Stdlib Python 3. No cloud required for the queue itself.
@@ -70,12 +71,22 @@ SKIP TKT-0001
 Approve while still `new` / `drafting` stores a **preferred worker** and acks.
 When the draft lands in `review`, handoff can use that pick automatically.
 
-## Optional: Cortland iMessage
+## Optional chat channels
 
-[Cortland](https://github.com/cortland-suite/cortland) is a governed Apple MCP
-with `notify_owner` (no recipient argument; handle fixed in local config).
-Point `HITL_NOTIFY=cortland` at a local `cortland-imessage` CLI if you have it.
-Default notifier prints to stdout so CI and fresh clones stay quiet.
+iMessage/Cortland is one option. Slack, Teams, Discord, or any webhook work
+without Apple gear. Chat apps are transport only — the ticket board stays
+the source of truth.
+
+```bash
+export HITL_NOTIFY=slack          # or teams | discord | webhook | cortland | multi
+export HITL_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...'
+# Approvals: CLI always works; or run a local reply ingress:
+export HITL_REPLY_TOKEN='long-random-string'
+python3 -m hitl_queue reply-server --port 8787
+# /hitl APPROVE TKT-0001 CLAUDE   (Slack slash → reply-server)
+```
+
+Full setup: [docs/CHANNELS.md](docs/CHANNELS.md).
 
 ## What this is not
 

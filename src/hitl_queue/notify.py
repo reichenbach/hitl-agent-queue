@@ -1,11 +1,15 @@
-"""Notifiers: stdout (default) or optional Cortland iMessage CLI."""
+"""Pluggable notifiers: stdout, Cortland, Slack, Teams, Discord, generic webhook."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
+from typing import Protocol
 
 PROGRESS_LABELS = {
     "new": "queued",
@@ -18,6 +22,10 @@ PROGRESS_LABELS = {
     "cancelled": "cancelled",
     "blocked": "blocked",
 }
+
+
+class Notifier(Protocol):
+    def notify(self, text: str, *, source: str = "hitl-queue") -> dict: ...
 
 
 def plain(s: str) -> str:
@@ -45,6 +53,25 @@ def progress_text(ticket: dict, status: str, *, detail: str = "") -> str:
     return line
 
 
+def _post_json(url: str, payload: dict, *, timeout: int = 20) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            return {"ok": True, "status": getattr(resp, "status", 200), "body": body[:500]}
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode("utf-8", "replace")[:500]
+        return {"ok": False, "status": exc.code, "error": err}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 class StdoutNotifier:
     def notify(self, text: str, *, source: str = "hitl-queue") -> dict:
         body = text.strip()
@@ -56,13 +83,8 @@ class CortlandNotifier:
     """Optional. Requires a local cortland-imessage CLI."""
 
     def __init__(self, cli: Path | None = None, node: str | None = None):
-        self.cli = Path(
-            cli
-            or os.environ.get(
-                "CORTLAND_IMESSAGE_CLI",
-                "",
-            )
-        )
+        raw = cli or os.environ.get("CORTLAND_IMESSAGE_CLI") or ""
+        self.cli = Path(raw) if raw else Path()
         self.node = node or os.environ.get("NODE_BIN", "node")
 
     def notify(self, text: str, *, source: str = "hitl-queue") -> dict:
@@ -87,8 +109,123 @@ class CortlandNotifier:
         }
 
 
+class SlackNotifier:
+    """Slack Incoming Webhook. Outbound only; replies via reply-server or CLI."""
+
+    def __init__(self, webhook_url: str | None = None):
+        self.url = (webhook_url or os.environ.get("HITL_SLACK_WEBHOOK_URL") or "").strip()
+
+    def notify(self, text: str, *, source: str = "hitl-queue") -> dict:
+        if not self.url:
+            return {"ok": False, "error": "set HITL_SLACK_WEBHOOK_URL"}
+        # Prefix source so channel history is searchable.
+        payload = {"text": f"[{source}]\n{text.strip()}"}
+        result = _post_json(self.url, payload)
+        result["channel"] = "slack"
+        return result
+
+
+class TeamsNotifier:
+    """Microsoft Teams Incoming Webhook (MessageCard-compatible text)."""
+
+    def __init__(self, webhook_url: str | None = None):
+        self.url = (webhook_url or os.environ.get("HITL_TEAMS_WEBHOOK_URL") or "").strip()
+
+    def notify(self, text: str, *, source: str = "hitl-queue") -> dict:
+        if not self.url:
+            return {"ok": False, "error": "set HITL_TEAMS_WEBHOOK_URL"}
+        body = text.strip()
+        # Adaptive-ish simple message works on classic and many Power Automate hooks.
+        payload = {
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "summary": source,
+            "themeColor": "0078D4",
+            "title": f"hitl-agent-queue · {source}",
+            "text": body.replace("\n", "  \n"),
+        }
+        result = _post_json(self.url, payload)
+        result["channel"] = "teams"
+        return result
+
+
+class DiscordNotifier:
+    """Discord channel webhook."""
+
+    def __init__(self, webhook_url: str | None = None):
+        self.url = (webhook_url or os.environ.get("HITL_DISCORD_WEBHOOK_URL") or "").strip()
+
+    def notify(self, text: str, *, source: str = "hitl-queue") -> dict:
+        if not self.url:
+            return {"ok": False, "error": "set HITL_DISCORD_WEBHOOK_URL"}
+        payload = {"content": f"**[{source}]**\n{text.strip()}"[:1900]}
+        result = _post_json(self.url, payload)
+        result["channel"] = "discord"
+        return result
+
+
+class GenericWebhookNotifier:
+    """POST JSON {text, source} to any URL (n8n, Zapier, custom)."""
+
+    def __init__(self, webhook_url: str | None = None):
+        self.url = (webhook_url or os.environ.get("HITL_WEBHOOK_URL") or "").strip()
+
+    def notify(self, text: str, *, source: str = "hitl-queue") -> dict:
+        if not self.url:
+            return {"ok": False, "error": "set HITL_WEBHOOK_URL"}
+        result = _post_json(self.url, {"text": text.strip(), "source": source})
+        result["channel"] = "webhook"
+        return result
+
+
+class MultiNotifier:
+    """Fan-out to several notifiers. Overall ok if any channel succeeds."""
+
+    def __init__(self, notifiers: list):
+        self.notifiers = list(notifiers)
+
+    def notify(self, text: str, *, source: str = "hitl-queue") -> dict:
+        results = []
+        for n in self.notifiers:
+            results.append(n.notify(text, source=source))
+        return {
+            "ok": any(r.get("ok") for r in results),
+            "channel": "multi",
+            "results": results,
+        }
+
+
+_BUILDERS = {
+    "stdout": lambda: StdoutNotifier(),
+    "cortland": lambda: CortlandNotifier(),
+    "slack": lambda: SlackNotifier(),
+    "teams": lambda: TeamsNotifier(),
+    "discord": lambda: DiscordNotifier(),
+    "webhook": lambda: GenericWebhookNotifier(),
+}
+
+
+def build_notifier(name: str):
+    key = name.strip().lower()
+    if key not in _BUILDERS:
+        raise ValueError(
+            f"Unknown notifier {name!r}. Choose: {', '.join(sorted(_BUILDERS))}"
+        )
+    return _BUILDERS[key]()
+
+
 def get_notifier():
-    mode = (os.environ.get("HITL_NOTIFY") or "stdout").lower()
-    if mode == "cortland":
-        return CortlandNotifier()
-    return StdoutNotifier()
+    """
+    HITL_NOTIFY selects the channel:
+      stdout (default) | cortland | slack | teams | discord | webhook
+      multi  → HITL_NOTIFY_CHANNELS=stdout,slack,teams
+    """
+    mode = (os.environ.get("HITL_NOTIFY") or "stdout").lower().strip()
+    if mode == "multi":
+        names = [
+            n.strip()
+            for n in (os.environ.get("HITL_NOTIFY_CHANNELS") or "stdout").split(",")
+            if n.strip()
+        ]
+        return MultiNotifier([build_notifier(n) for n in names])
+    return build_notifier(mode)

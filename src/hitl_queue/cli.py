@@ -45,6 +45,13 @@ def cmd_demo(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reply_server(args: argparse.Namespace) -> int:
+    from .reply_server import serve
+
+    serve(state_dir=args.state_dir, host=args.host, port=args.port)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="hitl-queue", description=__doc__)
     p.add_argument("--state-dir", default="state")
@@ -67,6 +74,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--research", default="")
     s = sub.add_parser("reply")
     s.add_argument("text")
+    s = sub.add_parser(
+        "reply-server",
+        help="HTTP ingress for Slack slash / Teams / webhook approvals",
+    )
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8787)
     s = sub.add_parser("done")
     s.add_argument("id")
     s.add_argument("--actor", default="worker")
@@ -77,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     if args.cmd == "demo":
         return cmd_demo(args)
+    if args.cmd == "reply-server":
+        return cmd_reply_server(args)
 
     q = _q(args)
     try:
