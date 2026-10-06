@@ -18,6 +18,12 @@ private operator setup. It ships:
 
 Stdlib Python 3. No cloud required for the queue itself.
 
+## Agent roles
+
+Cursor / Claude / Codex / Grokbot use the same board with different claims.
+Start at [AGENTS.md](AGENTS.md). Per-role sheets live under
+[docs/workers/](docs/workers/).
+
 ## Why this exists
 
 Multi-agent work fails in the same boring ways: duplicate effort, silent
