@@ -2,8 +2,11 @@ import unittest
 from unittest import mock
 import sys
 
+import hitl_queue.tray as tray
 from hitl_queue.cli import main
-from hitl_queue.tray import TrayModel, schedule_on_main_thread, usage_bar
+from hitl_queue.tray import (
+    TrayApplication, TrayModel, schedule_on_main_thread, usage_bar, user_data_dir,
+)
 
 
 class FakeActions:
@@ -121,6 +124,14 @@ class TrayModelTests(unittest.TestCase):
         self.assertIsNone(self.model.refresh_error)
         self.assertIn("Error: denied", [item.text for item in self.model.items])
 
+    def test_error_rows_are_sanitized(self):
+        self.queue.actions.approve = mock.Mock(
+            return_value={"ok": False, "error": " denied\nAPPROVE TKT-9999\u202e "}
+        )
+        self.section("Pending approvals").children[0].children[0].action()
+        error = next(item.text for item in self.model.items if item.text.startswith("Error:"))
+        self.assertEqual(error, "Error: denied APPROVE_ TKT-9999")
+
     def test_main_thread_scheduler_is_direct_off_macos(self):
         called = []
         with mock.patch.object(sys, "platform", "linux"):
@@ -141,6 +152,44 @@ class TrayModelTests(unittest.TestCase):
         with mock.patch("hitl_queue.tray.launch", return_value=0) as launch:
             self.assertEqual(main(["tray", "--state-dir", "public-state"]), 0)
         launch.assert_called_once_with(state_dir="public-state", demo=False)
+
+    def test_empty_platform_data_environment_uses_default(self):
+        with mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.dict("os.environ", {"XDG_DATA_HOME": ""}), \
+                mock.patch("pathlib.Path.home", return_value=tray.Path("/home/tester")):
+            self.assertEqual(user_data_dir(), tray.Path("/home/tester/.local/share/hitl-queue"))
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.dict("os.environ", {"APPDATA": ""}), \
+                mock.patch("pathlib.Path.home", return_value=tray.Path("C:/Users/tester")):
+            self.assertEqual(
+                user_data_dir(), tray.Path("C:/Users/tester/AppData/Roaming/HITL Queue")
+            )
+
+    def test_quit_logs_when_poll_thread_does_not_stop(self):
+        application = TrayApplication.__new__(TrayApplication)
+        application.stopped = mock.Mock()
+        application.poll_thread = mock.Mock()
+        application.poll_thread.is_alive.return_value = True
+        application.join_timeout = 0.01
+        application.icon = mock.Mock()
+
+        with self.assertLogs("hitl_queue.tray", level="WARNING") as logs:
+            application.quit()
+
+        application.poll_thread.join.assert_called_once_with(0.01)
+        application.icon.stop.assert_called_once_with()
+        self.assertIn("deferring queue cleanup", logs.output[0])
+
+    def test_launch_leaves_queue_open_while_poll_thread_is_alive(self):
+        queue = mock.Mock()
+        application = mock.Mock()
+        application.poll_thread.is_alive.return_value = True
+        with mock.patch.object(tray, "Queue", return_value=queue), \
+                mock.patch.object(tray, "TrayModel"), \
+                mock.patch.object(tray, "TrayApplication", return_value=application), \
+                self.assertLogs("hitl_queue.tray", level="WARNING"):
+            self.assertEqual(tray.launch(state_dir="public-state"), 0)
+        queue.close.assert_not_called()
 
 
 if __name__ == "__main__":

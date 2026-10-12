@@ -7,6 +7,7 @@ when the tray is actually launched.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,8 @@ from typing import Callable, Sequence
 
 from .queue import Queue
 from .text import sanitize_summary
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -83,7 +86,10 @@ class TrayModel:
             self._refresh_error = refresh_error
             errors = tuple(error for error in (self._action_error, refresh_error) if error)
         for error in errors:
-            sections.append(self._empty(f"Error: {error}"))
+            clean_error = sanitize_summary(
+                error, ellipsis=True, escape_ampersand=sys.platform == "win32"
+            )
+            sections.append(self._empty(f"Error: {clean_error}"))
         sections.extend((
             TrayItem("Open app", self.open_app),
             TrayItem("Refresh", self.refresh),
@@ -262,6 +268,12 @@ class TrayApplication:
         thread = self.poll_thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(self.join_timeout)
+            if thread.is_alive():
+                logger.warning(
+                    "Tray poll thread did not stop within %.1f seconds; "
+                    "deferring queue cleanup",
+                    self.join_timeout,
+                )
         self.icon.stop()
 
     def run(self) -> None:
@@ -274,6 +286,12 @@ class TrayApplication:
         finally:
             self.stopped.set()
             self.poll_thread.join(self.join_timeout)
+            if self.poll_thread.is_alive():
+                logger.warning(
+                    "Tray poll thread did not stop within %.1f seconds; "
+                    "deferring queue cleanup",
+                    self.join_timeout,
+                )
 
 
 def schedule_on_main_thread(callback: Callable[[], None]) -> object:
@@ -295,8 +313,10 @@ def user_data_dir() -> Path:
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "HITL Queue"
     if sys.platform == "win32":
-        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "HITL Queue"
-    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "hitl-queue"
+        base = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
+        return Path(base) / "HITL Queue"
+    base = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
+    return Path(base) / "hitl-queue"
 
 
 def launch(*, state_dir: str | Path | None = None, demo: bool = False) -> int:
@@ -316,10 +336,16 @@ def launch(*, state_dir: str | Path | None = None, demo: bool = False) -> int:
         agents_file = frozen_dir / "agents.toml" if frozen_dir else Path("agents.toml")
         if agents_file.is_file():
             queue.threads.configure_from(agents_file)
+    application = None
     try:
-        TrayApplication(TrayModel(queue)).run()
+        application = TrayApplication(TrayModel(queue))
+        application.run()
         return 0
     finally:
-        queue.close()
-        if temporary:
-            temporary.cleanup()
+        poll_thread = application.poll_thread if application is not None else None
+        if poll_thread is not None and poll_thread.is_alive():
+            logger.warning("Leaving queue open because the tray poll thread is still running")
+        else:
+            queue.close()
+            if temporary:
+                temporary.cleanup()
