@@ -187,6 +187,7 @@ class UsageMonitor:
                 (agent_key, item["window_key"], item["window_start"]),
             ))
         levels = (("warn", plan.warn_threshold), ("blocked", plan.blocked_threshold))
+        notify_error: BaseException | None = None
         for level, threshold in levels:
             if fraction < threshold:
                 continue
@@ -211,7 +212,10 @@ class UsageMonitor:
                     source="hitl-usage",
                 )
             except BaseException as exc:
-                raise UsageNotifyError(str(exc)) from exc
+                if notify_error is None:
+                    notify_error = exc
+        if notify_error is not None:
+            raise UsageNotifyError(str(notify_error)) from notify_error
 
 
 def _window(spec: str, now: float) -> tuple[float, str]:

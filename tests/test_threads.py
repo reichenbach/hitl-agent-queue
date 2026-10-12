@@ -381,7 +381,7 @@ class ThreadTests(unittest.TestCase):
     def test_usage_notify_failure_is_not_a_usage_record_failure(self):
         agent = FakeAgent(
             "Display Name", self.agent.limits, output="done", work_dir=self.work,
-            usage_plan=UsagePlan("daily", runs=1),
+            usage_plan=UsagePlan("daily", runs=1, warn_threshold=.5),
         )
         self.queue.threads.configure({"worker-key": agent})
         thread = self.queue.threads.create("Notify failure")
@@ -394,6 +394,7 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(len(result["replies"]), 1)
         events = [row["event"] for row in self.queue.threads.audit_log()]
         self.assertIn("usage_notify_error", events)
+        self.assertIn("usage_blocked", events)
         self.assertNotIn("usage_record_error", events)
 
     def test_audit_is_append_only_and_records_messages_runs_and_approval(self):
