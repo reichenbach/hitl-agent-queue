@@ -14,9 +14,13 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = []
+app = ["pywebview>=5"]
 
 [project.scripts]
 hitl-queue = "hitl_queue.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+hitl_queue = ["app.html"]

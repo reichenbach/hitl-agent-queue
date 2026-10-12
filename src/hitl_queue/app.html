@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HITL queue - demo board</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --card: #1e222b; --line: #2a2f3a;
+    --text: #e6e8ec; --muted: #8b93a3; --accent: #6ea8fe;
+    --ok: #3ecf8e; --warn: #f5b84d; --bad: #f06a6a;
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 15px; margin: 0; }
+  header .sub { color: var(--muted); }
+  #gate { padding: 9px 18px; font-weight: 500; border-bottom: 1px solid var(--line); }
+  #gate.closed { background: rgba(245, 184, 77, .12); color: var(--warn); }
+  #gate.open { background: rgba(62, 207, 142, .12); color: var(--ok); }
+  main { flex: 1; display: grid; grid-template-columns: 1fr 400px; min-height: 0; }
+  #board-wrap { overflow: auto; padding: 14px 18px; }
+  #board { display: grid; grid-template-columns: repeat(6, minmax(170px, 1fr)); gap: 10px; }
+  .col { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px; min-height: 160px; }
+  .col h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 2px 4px 8px; display: flex; justify-content: space-between; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-bottom: 6px; cursor: pointer; }
+  .card:hover { border-color: var(--accent); }
+  .card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .card .id { color: var(--muted); font-size: 11px; }
+  .card .title { font-weight: 600; margin: 2px 0; }
+  .card .company { color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .chip { font-size: 10.5px; padding: 1px 6px; border-radius: 10px; background: #2a3040; color: #c9d1e3; }
+  .chip.worker { background: rgba(110, 168, 254, .18); color: var(--accent); }
+  details#side-lane { margin-top: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  details#side-lane > summary { cursor: pointer; padding: 9px 12px; color: var(--muted); font-weight: 600; }
+  #side-body { display: grid; grid-template-columns: repeat(3, minmax(170px, 1fr)); gap: 10px; padding: 0 10px 10px; }
+  aside { border-left: 1px solid var(--line); overflow: auto; display: flex; flex-direction: column; }
+  aside section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  aside h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .empty { color: var(--muted); font-style: italic; }
+  .status { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; background: #2a3040; }
+  .status.review { background: rgba(245, 184, 77, .2); color: var(--warn); }
+  .status.handoff, .status.approved { background: rgba(110, 168, 254, .2); color: var(--accent); }
+  .status.done { background: rgba(62, 207, 142, .2); color: var(--ok); }
+  .status.blocked, .status.skipped, .status.cancelled { background: rgba(240, 106, 106, .18); color: var(--bad); }
+  #detail h4 { margin: 6px 0 2px; font-size: 15px; }
+  .meta { display: grid; grid-template-columns: 110px 1fr; gap: 2px 8px; margin: 10px 0; }
+  .meta dt { color: var(--muted); }
+  .meta dd { margin: 0; word-break: break-word; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 4px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--text); padding: 5px 10px; border-radius: 6px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.approve { border-color: rgba(110, 168, 254, .5); }
+  button.skip { border-color: rgba(240, 106, 106, .5); }
+  .hint { color: var(--muted); font-size: 11.5px; }
+  .file { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; margin-bottom: 6px; }
+  .file .path { color: var(--muted); font-size: 11px; word-break: break-all; }
+  pre { white-space: pre-wrap; background: var(--bg); border-radius: 4px; padding: 6px; margin: 6px 0 0; max-height: 160px; overflow: auto; font-size: 11.5px; }
+  ol.history { list-style: none; padding: 0; margin: 0; }
+  ol.history li { padding: 4px 0 4px 10px; border-left: 2px solid var(--line); margin-left: 4px; }
+  ol.history .when { color: var(--muted); font-size: 11px; }
+  .toggle { display: flex; align-items: center; gap: 8px; margin: 6px 0 10px; cursor: pointer; }
+  .outbox-item { border-top: 1px solid var(--line); padding: 6px 0; }
+  .outbox-item .src { color: var(--muted); font-size: 11px; }
+  .outbox-item.muted { opacity: .55; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--card); border: 1px solid var(--line); padding: 8px 14px; border-radius: 6px; display: none; }
+  #toast.err { border-color: var(--bad); color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>HITL agent queue</h1>
+  <span class="sub">Demo board &middot; synthetic data in a throwaway state dir</span>
+</header>
+<div id="gate">Loading apply gate&hellip;</div>
+<main>
+  <div id="board-wrap">
+    <div id="board"></div>
+    <details id="side-lane">
+      <summary id="side-summary">Blocked / skipped / cancelled</summary>
+      <div id="side-body"></div>
+    </details>
+  </div>
+  <aside>
+    <section id="detail"><h3>Ticket</h3><p class="empty">Select a ticket to see files and history.</p></section>
+    <section id="notifier"><h3>Notifier</h3></section>
+  </aside>
+</main>
+<div id="toast"></div>
+<script>
+const BOOT = /*__HITL_BOOT__*/null || { transport: "http", token: "" };
+let selectedId = null;
+
+function ready() {
+  if (BOOT.transport !== "pywebview") return Promise.resolve();
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.board) return Promise.resolve();
+  return new Promise((resolve) => window.addEventListener("pywebviewready", resolve, { once: true }));
+}
+
+async function call(name, ...args) {
+  if (BOOT.transport === "pywebview") return window.pywebview.api[name](...args);
+  const res = await fetch("/api/" + name, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Hitl-Token": BOOT.token },
+    body: JSON.stringify({ args }),
+  });
+  const body = await res.json();
+  if (!res.ok) throw new Error(body.error || res.statusText);
+  return body;
+}
+
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (key === "text") node.textContent = value;
+    else if (key === "class") node.className = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (value !== false && value != null) node.setAttribute(key, value === true ? "" : value);
+  }
+  for (const child of [].concat(children)) if (child) node.append(child);
+  return node;
+}
+
+const when = (epoch) => new Date(epoch * 1000).toLocaleString();
+
+function toast(message, isError = false) {
+  const node = document.getElementById("toast");
+  node.textContent = message;
+  node.className = isError ? "err" : "";
+  node.style.display = "block";
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => (node.style.display = "none"), 3500);
+}
+
+function renderGate(gate) {
+  const node = document.getElementById("gate");
+  node.className = gate.open ? "open" : "closed";
+  node.textContent = gate.open
+    ? `Apply gate OPEN since ${gate.apply_opens} - approvals hand off in "apply" mode.`
+    : `Apply gate CLOSED until ${gate.apply_opens} - approvals hand off in "review_only" mode (workers prepare, do not apply).`;
+}
+
+function card(ticket) {
+  const chips = [el("span", { class: "chip", text: ticket.kind })];
+  if (ticket.preferred_worker) chips.push(el("span", { class: "chip worker", text: `pick: ${ticket.preferred_worker}` }));
+  if (ticket.handoff_worker) chips.push(el("span", { class: "chip worker", text: `-> ${ticket.handoff_worker}` }));
+  if (ticket.owner) chips.push(el("span", { class: "chip", text: ticket.owner }));
+  return el("div", {
+    class: "card" + (ticket.id === selectedId ? " selected" : ""),
+    onclick: () => select(ticket.id),
+  }, [
+    el("div", { class: "id", text: ticket.id }),
+    el("div", { class: "title", text: ticket.title }),
+    el("div", { class: "company", text: ticket.company || "" }),
+    el("div", { class: "chips" }, chips),
+  ]);
+}
+
+function column(lane) {
+  return el("div", { class: "col" }, [
+    el("h2", {}, [el("span", { text: lane.status }), el("span", { text: String(lane.tickets.length) })]),
+    ...(lane.tickets.length ? lane.tickets.map(card) : [el("p", { class: "empty", text: "empty" })]),
+  ]);
+}
+
+function renderBoard(board) {
+  document.getElementById("board").replaceChildren(...board.columns.map(column));
+  document.getElementById("side-body").replaceChildren(...board.side_lane.map(column));
+  const total = board.side_lane.reduce((n, lane) => n + lane.tickets.length, 0);
+  document.getElementById("side-summary").textContent = `Blocked / skipped / cancelled (${total})`;
+}
+
+function fileBlock(file) {
+  const meta = file.exists ? `${file.size} bytes` : (file.note || "missing");
+  const children = [
+    el("div", {}, [el("strong", { text: file.label }), el("span", { class: "hint", text: `  ${meta}` })]),
+    el("div", { class: "path", text: file.path }),
+  ];
+  if (file.preview != null) children.push(el("pre", { text: file.preview + (file.truncated ? "\n..." : "") }));
+  return el("div", { class: "file" }, children);
+}
+
+function renderDetail(detail) {
+  const section = document.getElementById("detail");
+  if (!detail || !detail.ok) {
+    section.replaceChildren(el("h3", { text: "Ticket" }), el("p", { class: "empty", text: detail ? detail.error : "Select a ticket to see files and history." }));
+    return;
+  }
+  const t = detail.ticket;
+  const payload = t.payload || {};
+  const handoff = payload.handoff;
+  const rows = [
+    ["Kind", t.kind], ["Owner", t.owner], ["URL", t.url],
+    ["Preferred", payload.preferred_worker],
+    ["Handoff", handoff && `${handoff.worker} (${handoff.mode})`],
+    ["Reason", payload.reason], ["Research", payload.research_summary],
+  ].filter(([, value]) => value);
+  const act = (label, cls, enabled, fn) => el("button", { class: cls, disabled: !enabled, onclick: fn, text: label });
+
+  section.replaceChildren(
+    el("h3", { text: "Ticket" }),
+    el("div", {}, [el("span", { class: "hint", text: t.id + "  " }), el("span", { class: `status ${t.status}`, text: t.status })]),
+    el("h4", { text: t.title }),
+    el("div", { class: "hint", text: t.company || "" }),
+    el("div", { class: "actions" }, [
+      act("Approve -> Codex", "approve", t.can_approve, () => runAction("approve", t.id, "codex")),
+      act("Approve -> Claude", "approve", t.can_approve, () => runAction("approve", t.id, "claude")),
+      act("Skip", "skip", t.can_skip, () => runAction("skip", t.id)),
+    ]),
+    el("div", { class: "hint", text: "Buttons call hitl_queue.actions locally. Nothing is sent." }),
+    el("dl", { class: "meta" }, rows.flatMap(([k, v]) => [el("dt", { text: k }), el("dd", { text: String(v) })])),
+    el("h3", { text: `Files (${detail.files.length})` }),
+    ...(detail.files.length ? detail.files.map(fileBlock) : [el("p", { class: "empty", text: "No files yet." })]),
+    el("h3", { text: "Status history" }),
+    el("ol", { class: "history" }, detail.history.map((ev) => el("li", {}, [
+      el("div", {}, [el("span", { class: `status ${ev.status}`, text: ev.status }), el("span", { text: `  ${ev.actor}` })]),
+      ev.note ? el("div", { text: ev.note }) : null,
+      el("div", { class: "when", text: when(ev.at) }),
+    ]))),
+  );
+}
+
+function renderNotifier(n) {
+  const toggle = el("input", { type: "checkbox", checked: n.muted, onchange: async (e) => {
+    try { renderNotifier(await call("set_mute", e.target.checked)); }
+    catch (err) { toast(err.message, true); }
+  } });
+  const items = n.outbox.map((m) => el("div", { class: "outbox-item" + (m.channel === "muted" ? " muted" : "") }, [
+    el("div", { class: "src", text: `${m.source} · ${m.channel === "muted" ? "suppressed (muted)" : "recorded"} · ${when(m.at)}` }),
+    el("pre", { text: m.text }),
+  ]));
+  document.getElementById("notifier").replaceChildren(
+    el("h3", { text: "Notifier" }),
+    el("dl", { class: "meta" }, [
+      el("dt", { text: "Channel" }), el("dd", { text: "local outbox (demo, never sends)" }),
+      el("dt", { text: "HITL_NOTIFY" }), el("dd", { text: `${n.configured} (ignored in demo)` }),
+      el("dt", { text: "State" }), el("dd", { text: n.muted ? "muted" : "live (to outbox)" }),
+    ]),
+    el("label", { class: "toggle" }, [toggle, el("span", { text: "Mute notifications" })]),
+    ...(items.length ? items : [el("p", { class: "empty", text: "No notifications yet. Approve or skip a ticket." })]),
+  );
+}
+
+async function refresh() {
+  const board = await call("board");
+  renderGate(board.gate);
+  renderBoard(board);
+  renderNotifier(board.notifier);
+  renderDetail(selectedId ? await call("ticket", selectedId) : null);
+}
+
+async function select(id) {
+  selectedId = id;
+  try { await refresh(); } catch (err) { toast(err.message, true); }
+}
+
+async function runAction(name, ...args) {
+  try {
+    const result = await call(name, ...args);
+    if (result.ok) {
+      const extra = result.worker ? ` -> ${result.worker}` + (result.mode ? ` (${result.mode})` : "") : "";
+      toast(`${result.action} ${result.id}${extra}`);
+    } else {
+      toast(result.error || "action failed", true);
+    }
+    await refresh();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+ready().then(refresh).catch((err) => toast(err.message, true));
+</script>
+</body>
+</html>

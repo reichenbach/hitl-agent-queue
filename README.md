@@ -77,6 +77,21 @@ SKIP TKT-0001
 Approve while still `new` / `drafting` stores a **preferred worker** and acks.
 When the draft lands in `review`, handoff can use that pick automatically.
 
+## Desktop board (demo data)
+
+```bash
+pip install -e ".[app]"          # optional: pywebview window
+python3 -m hitl_queue app        # falls back to your browser without pywebview
+python3 -m hitl_queue app --browser --apply-opens 2026-01-01
+```
+
+The app seeds synthetic tickets into a throwaway state dir (it ignores
+`--state-dir`). It shows one column per status, a collapsed
+blocked/skipped/cancelled lane, ticket files and status history, and the
+`apply_opens` gate. Approve and Skip buttons call `hitl_queue.actions`.
+Notifications go to a local outbox panel with a mute toggle and are never
+sent.
+
 ## Optional chat channels
 
 iMessage/Cortland is one option. Slack, Teams, Discord, or any webhook work
