@@ -92,6 +92,18 @@ blocked/skipped/cancelled lane, ticket files and status history, and the
 Notifications go to a local outbox panel with a mute toggle and are never
 sent.
 
+## Desktop app (macOS)
+
+Build the standalone desktop app with the project-local virtualenv:
+
+```bash
+make app
+open "dist/HITL Queue.app"
+```
+
+The build is unsigned. The first time you launch it, right-click
+`HITL Queue.app` and choose **Open** to approve it in macOS.
+
 ## Optional chat channels
 
 iMessage/Cortland is one option. Slack, Teams, Discord, or any webhook work
