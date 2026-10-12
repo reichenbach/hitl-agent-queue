@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -39,6 +40,7 @@ class OpenAICompatAgent(Agent):
 
     def _run(self, prompt: str, cwd: Path, cancel_event) -> AgentResult:
         started = time.monotonic()
+        deadline = started + self.limits.timeout_seconds
         body = json.dumps(
             {"model": self.model, "messages": [{"role": "user", "content": prompt}]}
         ).encode("utf-8")
@@ -58,8 +60,30 @@ class OpenAICompatAgent(Agent):
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({}), _NoRedirect()
             )
-            with opener.open(request, timeout=self.limits.timeout_seconds) as response:
-                raw = response.read(self.limits.max_output_bytes + 1)
+            socket_timeout = min(self.limits.timeout_seconds, 0.25)
+            with opener.open(request, timeout=socket_timeout) as response:
+                chunks = []
+                size = 0
+                while size <= self.limits.max_output_bytes:
+                    if cancel_event.is_set():
+                        return AgentResult(
+                            "", False, "cancelled", time.monotonic() - started, 0
+                        )
+                    if time.monotonic() >= deadline:
+                        return AgentResult(
+                            "", False, "timed out", time.monotonic() - started, None
+                        )
+                    try:
+                        chunk = response.read(
+                            min(65536, self.limits.max_output_bytes + 1 - size)
+                        )
+                    except (socket.timeout, TimeoutError):
+                        continue
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                raw = b"".join(chunks)
             if len(raw) > self.limits.max_output_bytes:
                 return AgentResult(
                     "", False, "response body exceeded max_output_bytes",

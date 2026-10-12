@@ -32,7 +32,12 @@ class _Response:
         return False
 
     def read(self, size=-1) -> bytes:
-        return self.payload if size < 0 else self.payload[:size]
+        if not self.payload:
+            return b""
+        if size < 0:
+            size = len(self.payload)
+        chunk, self.payload = self.payload[:size], self.payload[size:]
+        return chunk
 
 
 class _Opener:
@@ -234,7 +239,7 @@ timeout_seconds = 10
         self.assertEqual(result.output, "local answer")
         request, kwargs = opener.calls[0]
         self.assertEqual(request.full_url, "http://192.168.1.20:8000/v1/chat/completions")
-        self.assertEqual(kwargs["timeout"], 2)
+        self.assertEqual(kwargs["timeout"], 0.25)
         self.assertEqual(
             json.loads(request.data),
             {"model": "test-model", "messages": [{"role": "user", "content": "say hi"}]},

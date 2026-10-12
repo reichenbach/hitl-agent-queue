@@ -84,9 +84,12 @@ class Threads:
             BEFORE DELETE ON audit_log BEGIN
               SELECT RAISE(ABORT, 'audit_log is append-only');
             END;
-            CREATE TRIGGER IF NOT EXISTS audit_log_monotonic_seq
-            BEFORE INSERT ON audit_log
-            WHEN NEW.seq != -1 AND NEW.seq <= COALESCE((SELECT MAX(seq) FROM audit_log), 0)
+            DROP TRIGGER IF EXISTS audit_log_monotonic_seq;
+            CREATE TRIGGER audit_log_monotonic_seq
+            AFTER INSERT ON audit_log
+            WHEN NEW.seq <= COALESCE(
+              (SELECT MAX(seq) FROM audit_log WHERE rowid != NEW.rowid), 0
+            )
             BEGIN
               SELECT RAISE(ABORT, 'audit_log sequence must increase');
             END;
@@ -283,7 +286,7 @@ class Threads:
         lines = []
         for message in self.messages(thread_id):
             role = "user" if message["author_type"] == "user" else f"agent:{message['author']}"
-            body = message["body"].replace("\r", "").replace("\n", "\n  ")
+            body = self._escape_multiline(message["body"])
             lines.append(f"[{role}] {message['author']}: {body}")
         transcript = "\n".join(lines)
         policy = (
@@ -292,7 +295,15 @@ class Threads:
             'ACTION_REQUEST: {"action":"push|merge|send|network","summary":"..."}. '
             "The queue will create a human approval ticket; do not perform the action."
         )
-        return f"Safety policy:\n{policy}\n\nThread transcript:\n{transcript}\n\nCurrent task:\n{task}"
+        escaped_task = self._escape_multiline(task, indent_first=True)
+        return f"Safety policy:\n{policy}\n\nThread transcript:\n{transcript}\n\nCurrent task:\n{escaped_task}"
+
+    @staticmethod
+    def _escape_multiline(text: str, *, indent_first: bool = False) -> str:
+        """Normalize every Unicode line boundary and quote non-record lines."""
+        lines = text.splitlines() or [""]
+        escaped = "\n  ".join(lines)
+        return f"  {escaped}" if indent_first else escaped
 
     def _gate_action_requests(self, thread_id: str, agent: str, output: str) -> None:
         for match in ACTION_RE.finditer(output):
@@ -364,8 +375,6 @@ class Threads:
         if not any(work_dir.is_relative_to(folder.resolve()) for folder in agent.limits.allowed_folders):
             raise ValueError(f"agent {agent.name!r} work_dir must be inside allowed_folders")
         state = self.queue.state
-        if any(state.is_relative_to(folder.resolve()) for folder in agent.limits.allowed_folders):
-            raise ValueError(f"agent {agent.name!r} allowed_folders must not contain the state directory")
         if state.is_relative_to(work_dir) or work_dir.is_relative_to(state):
             raise ValueError(f"agent {agent.name!r} work_dir must not overlap the state directory")
 
@@ -401,8 +410,25 @@ class Threads:
             self.queue._event(ticket_id, "review", agent, "requires human approval")
             self.queue.audit(
                 "approval_requested", actor=agent, thread_id=thread_id,
-                ticket_id=ticket_id, detail={"type": request_type, **request},
+                ticket_id=ticket_id, detail={**request, "type": request_type},
             )
             return self.queue.get(ticket_id)
 
-        return self.queue.transaction(create)
+        ticket = self.queue.transaction(create)
+        self.queue._notify(
+            f"{ticket['id']} ready\n - {ticket['title']}\n"
+            f"Reply:\nAPPROVE {ticket['id']} CODEX\n"
+            f"APPROVE {ticket['id']} CLAUDE\nSKIP {ticket['id']}",
+            source="hitl-review",
+        )
+        return ticket
+
+    def dispatch_approved_agent_task(self, ticket: dict) -> list[dict]:
+        request = ticket["payload"]["agent_task"]
+        thread_id = next(
+            row["thread_id"] for row in self.audit_log()
+            if row["ticket_id"] == ticket["id"] and row["event"] == "approval_requested"
+        )
+        return self._wake(
+            thread_id, request["target_agent"], request["task"], "user", "human-approval"
+        )

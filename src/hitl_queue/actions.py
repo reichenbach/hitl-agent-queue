@@ -33,6 +33,19 @@ class Actions:
                 "notification": notification,
             }
 
+        agent_task = (ticket.get("payload") or {}).get("agent_task")
+        if ticket["status"] == "review" and agent_task:
+            self.queue.approve(tid, actor="human", note="approved agent task")
+            replies = self.queue.threads.dispatch_approved_agent_task(ticket)
+            self.queue.done(tid, actor="human", note="approved agent task dispatched")
+            notification = self.queue._notify(
+                f"OK {tid} agent task dispatched", source="hitl-reply"
+            )
+            return {
+                "ok": True, "action": "dispatch_agent_task", "id": tid,
+                "replies": replies, "notification": notification,
+            }
+
         if ticket["status"] == "review":
             self.queue.approve(tid, actor="human", note=f"APPROVE → {worker}")
         elif ticket["status"] != "approved":
