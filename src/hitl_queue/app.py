@@ -95,37 +95,34 @@ def _force_status(queue: Queue, tid: str, status: str, note: str) -> None:
     queue.transaction(lambda: queue._set(tid, status, "demo", note))
 
 
-def _demo_ticket(queue: Queue, n: int, title: str, company: str, *, kind: str = "job_draft") -> str:
+def _demo_ticket(queue: Queue, n: int, title: str, *, kind: str = "task") -> str:
     return queue.enqueue(
         title=title,
-        company=company,
-        url=f"https://example.com/jobs/{n}",
+        url=f"https://example.com/items/{n}",
         kind=kind,
         reason="Synthetic demo ticket",
         actor="demo",
     )["id"]
 
 
-def _drafted(queue: Queue, n: int, title: str, company: str) -> str:
-    tid = _demo_ticket(queue, n, title, company)
+def _drafted(queue: Queue, n: int, title: str) -> str:
+    tid = _demo_ticket(queue, n, title)
     queue.claim(tid, "cursor-draft")
     slug = tid.lower()
     queue.submit_draft(
         tid,
         actor="cursor-draft",
-        resume=_demo_file(
-            queue,
-            f"{slug}-resume.md",
-            f"# Synthetic resume for {title}\n\n- Built durable agent work queues\n"
-            "- Shipped human-in-the-loop approval flows\n",
-        ),
-        cover_letter=_demo_file(
-            queue,
-            f"{slug}-cover-letter.md",
-            f"Hello {company} team,\n\nThis is a synthetic cover letter for the "
-            f"{title} demo ticket.\n",
-        ),
-        research_summary=f"{company} (synthetic): remote-friendly, workflow automation focus.",
+        research_summary="Synthetic context for a neutral workflow demonstration.",
+    )
+    ticket = queue.get(tid)
+    payload = ticket["payload"]
+    payload["artifacts"] = {
+        "brief": _demo_file(queue, f"{slug}-brief.md", f"# Brief: {title}\n\nSynthetic demo content.\n"),
+        "checklist": _demo_file(queue, f"{slug}-checklist.md", "# Checklist\n\n- Review\n- Approve or skip\n"),
+    }
+    queue.db.execute(
+        "UPDATE tickets SET payload=?,updated=? WHERE id=?",
+        (json.dumps(payload, sort_keys=True), time.time(), tid),
     )
     return tid
 
@@ -134,35 +131,35 @@ def seed_demo(queue: OutboxQueue) -> None:
     """Populate every board column and the side lane with synthetic tickets."""
     mode = "apply" if apply_gate_open(queue.cfg) else "review_only"
 
-    _demo_ticket(queue, 1, "Workflow Automation Engineer", "Example Logistics")
-    site = _demo_ticket(queue, 2, "Portfolio landing page refresh", "Example Studio", kind="site")
+    _demo_ticket(queue, 1, "Review intake checklist")
+    site = _demo_ticket(queue, 2, "Refresh project landing page", kind="site")
     queue.actions.approve(site, "claude")
 
-    drafting = _demo_ticket(queue, 3, "Agent Platform Engineer", "Example Bank")
+    drafting = _demo_ticket(queue, 3, "Summarize workshop notes")
     queue.claim(drafting, "cursor-draft")
 
-    _drafted(queue, 4, "AI Workflow Engineer", "Example Health")
-    _drafted(queue, 5, "Internal Tools Engineer", "Example Retail")
+    _drafted(queue, 4, "Prepare release checklist")
+    _drafted(queue, 5, "Organize feedback themes")
 
-    approved = _drafted(queue, 6, "Solutions Engineer, Automation", "Example Freight")
+    approved = _drafted(queue, 6, "Draft onboarding outline")
     queue.approve(approved, actor="human", note="demo approval")
 
-    handoff = _drafted(queue, 7, "Developer Experience Engineer", "Example Cloud")
+    handoff = _drafted(queue, 7, "Update documentation index")
     queue.approve(handoff, actor="human", note="demo approval")
     queue.handoff(handoff, to="codex", actor="human", mode=mode)
 
-    done = _drafted(queue, 8, "Support Automation Lead", "Example Telecom")
+    done = _drafted(queue, 8, "Archive completed notes")
     queue.approve(done, actor="human", note="demo approval")
     queue.handoff(done, to="claude", actor="human", mode=mode)
     queue.done(done, actor="claude", note=f"{mode} complete (synthetic)")
 
-    blocked = _demo_ticket(queue, 9, "Platform Reliability Engineer", "Example Energy")
+    blocked = _demo_ticket(queue, 9, "Confirm missing reference")
     queue.claim(blocked, "cursor-draft")
     _force_status(queue, blocked, "blocked", "waiting on synthetic portfolio link")
 
-    queue.actions.skip(_demo_ticket(queue, 10, "Onsite Data Analyst", "Example Mill"))
+    queue.actions.skip(_demo_ticket(queue, 10, "Retire outdated checklist"))
 
-    cancelled = _demo_ticket(queue, 11, "Duplicate posting", "Example Logistics")
+    cancelled = _demo_ticket(queue, 11, "Duplicate request")
     _force_status(queue, cancelled, "cancelled", "duplicate of TKT-0001")
 
     queue.clear_notifications()

@@ -3,8 +3,8 @@
 **Coordinate several coding agents with one human gate.**
 
 Cursor drafts. Claude or Codex applies / ships. You approve from your phone.
-No agent-to-agent chat relay. No shared brain crawl. A durable ticket board
-is the bus.
+Durable tickets remain the work bus; bounded, audited threads are available
+for explicit agent turns.
 
 This is a **public, synthetic** reference for the same playbook used in a
 private operator setup. It ships:
@@ -15,6 +15,7 @@ private operator setup. It ships:
 - reply grammar: `APPROVE TICKET-ID CODEX|CLAUDE` / `SKIP TICKET-ID`
 - optional reply server for Slack slash commands and Teams/Zapier ingress
 - a synthetic end-to-end demo you can run locally
+- durable user/agent threads with run limits, pause/resume/kill, and audit logs
 
 Stdlib Python 3. No cloud required for the queue itself.
 
@@ -77,6 +78,34 @@ SKIP TKT-0001
 Approve while still `new` / `drafting` stores a **preferred worker** and acks.
 When the draft lands in `review`, handoff can use that pick automatically.
 
+## Agent threads
+
+Threads use the same `queue.sqlite3` database. Configure adapters from the
+existing TOML file, then post explicit mentions:
+
+```python
+queue.threads.configure_from("agents.toml")
+thread = queue.threads.create("Release notes", max_agent_runs=6)
+queue.threads.post(thread["id"], "user", "@codex task: summarize the changes")
+queue.threads.post(thread["id"], "user", "@codex fyi: no action needed")
+```
+
+`task:` wakes an active adapter; `fyi:` never does. `pause`, `resume`, and
+`kill` accept an agent name or no name for all agents. Each adapter keeps its
+configured timeout, and the thread run budget bounds agent-to-agent turns.
+
+Agents cannot directly request irreversible or outbound work. They emit one
+JSON line, which creates a normal ticket in `review` for the existing
+approve/skip flow:
+
+```text
+ACTION_REQUEST: {"action":"push","summary":"publish the reviewed branch","target":"origin"}
+```
+
+Allowed action names are `push`, `merge`, `send`, and `network`. Messages,
+run start/end results and durations, and approval decisions are copied into
+an append-only `audit_log` table.
+
 ## Desktop board (demo data)
 
 ```bash
@@ -123,7 +152,7 @@ Full setup: [docs/CHANNELS.md](docs/CHANNELS.md).
 
 ## What this is not
 
-- Not a framework that makes agents talk to each other
+- Not an unbounded or unaudited agent chat relay
 - Not an ATS scraper or auto-apply bot for the public demo
 - Not your private second brain, mail, or credentials
 - Not a substitute for reading the ticket before you approve

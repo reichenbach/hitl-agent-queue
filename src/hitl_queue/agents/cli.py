@@ -41,6 +41,14 @@ class CliAgent(Agent):
         self.turns_flag = turns_flag
         self.prompt_via = prompt_via
         self.env_passthrough = tuple(env_passthrough)
+        self._process_lock = threading.Lock()
+        self._process: subprocess.Popen[bytes] | None = None
+
+    def cancel(self) -> None:
+        with self._process_lock:
+            process = self._process
+        if process is not None:
+            _terminate_process_group(process)
 
     def _run(self, prompt: str, cwd: Path) -> AgentResult:
         started = time.monotonic()
@@ -65,6 +73,8 @@ class CliAgent(Agent):
                 env=env,
                 start_new_session=True,
             )
+            with self._process_lock:
+                self._process = process
             assert process.stdout is not None and process.stderr is not None
             stdout_capture = _BoundedCapture(self.limits.max_output_bytes)
             stderr_capture = _BoundedCapture(self.limits.max_output_bytes)
@@ -91,6 +101,9 @@ class CliAgent(Agent):
         finally:
             if process is not None:
                 _terminate_process_group(process)
+            with self._process_lock:
+                if self._process is process:
+                    self._process = None
             for worker in workers:
                 worker.join()
         output, truncated = stdout_capture.result()

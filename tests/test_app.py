@@ -76,9 +76,9 @@ class AppApiTests(_DemoCase):
         detail = self.api.ticket(tid)
         self.assertTrue(detail["ok"])
         files = detail["files"]
-        self.assertEqual([f["label"] for f in files], ["cover_letter", "resume", "handoff packet"])
+        self.assertEqual([f["label"] for f in files], ["brief", "checklist", "handoff packet"])
         self.assertTrue(all(f["exists"] for f in files))
-        self.assertIn("Synthetic resume", files[1]["preview"])
+        self.assertIn("Synthetic demo content", files[0]["preview"])
         self.assertEqual(json.loads(files[2]["preview"])["worker"], "codex")
         self.assertEqual(
             [e["status"] for e in detail["history"]],
@@ -92,7 +92,7 @@ class AppApiTests(_DemoCase):
         with tempfile.TemporaryDirectory() as other:
             outside = Path(other) / "private.txt"
             outside.write_text("private", encoding="utf-8")
-            info = self.api._file_info("resume", str(outside))
+            info = self.api._file_info("artifact", str(outside))
         self.assertFalse(info["exists"])
         self.assertIsNone(info["preview"])
         self.assertIn("not read", info["note"])

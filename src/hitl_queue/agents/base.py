@@ -73,6 +73,9 @@ class Agent(ABC):
             )
         return result
 
+    def cancel(self) -> None:
+        """Ask an in-flight run to stop. Adapters override when applicable."""
+
     @abstractmethod
     def _run(self, prompt: str, cwd: Path) -> AgentResult:
         """Run the adapter after common safety checks."""

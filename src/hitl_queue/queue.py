@@ -105,8 +105,37 @@ class Queue:
 
         # Imported lazily to keep the action layer independent of construction.
         from .actions import Actions
+        from .threads import Threads
 
         self.actions = Actions(self)
+        self.threads = Threads(self)
+
+    def audit(
+        self,
+        event: str,
+        *,
+        actor: str,
+        thread_id: str | None = None,
+        message_id: int | None = None,
+        run_id: int | None = None,
+        ticket_id: str | None = None,
+        detail: dict | None = None,
+    ) -> None:
+        """Append one immutable audit record."""
+        self.db.execute(
+            "INSERT INTO audit_log(event,actor,thread_id,message_id,run_id,ticket_id,detail,at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                event,
+                actor,
+                thread_id,
+                message_id,
+                run_id,
+                ticket_id,
+                json.dumps(detail or {}, sort_keys=True),
+                time.time(),
+            ),
+        )
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -371,6 +400,10 @@ class Queue:
             return self._set(tid, "approved", actor, note or "approved")
 
         ticket = self.transaction(action)
+        self.audit(
+            "approval", actor=actor, ticket_id=tid,
+            detail={"decision": "approve", "note": note or "approved"},
+        )
         self._ping(ticket, "approved", detail=note or actor)
         return ticket
 
@@ -379,6 +412,10 @@ class Queue:
             return self._set(tid, "skipped", actor, note or "skipped")
 
         ticket = self.transaction(action)
+        self.audit(
+            "approval", actor=actor, ticket_id=tid,
+            detail={"decision": "skip", "note": note or "skipped"},
+        )
         self._ping(ticket, "skipped", detail=note or actor)
         return ticket
 

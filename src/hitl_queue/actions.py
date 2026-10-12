@@ -20,6 +20,10 @@ class Actions:
 
         ticket = self.queue.get(tid)
         if ticket["status"] in {"new", "drafting"}:
+            self.queue.audit(
+                "approval", actor="human", ticket_id=tid,
+                detail={"decision": "prefer_worker", "worker": worker},
+            )
             self.queue.set_preferred_worker(tid, worker)
             notification = self.queue._notify(
                 f"Got it. {tid} → {worker} after draft. Reply SKIP {tid} to cancel.",
@@ -44,6 +48,11 @@ class Actions:
                 "error": f"status {ticket['status']}",
                 "notification": notification,
             }
+        else:
+            self.queue.audit(
+                "approval", actor="human", ticket_id=tid,
+                detail={"decision": "approve", "worker": worker, "already_approved": True},
+            )
 
         from .queue import apply_gate_open
 
