@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -113,6 +114,68 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(choice["agent"], "Beta")
         self.assertEqual(choice["skipped"]["Gamma"], "paused")
         self.assertIn("100.0% quota headroom", choice["explanation"])
+
+    def test_concurrent_posts_reserve_run_quota_before_agent_execution(self):
+        agent = self.agent(plan=UsagePlan("daily", runs=1))
+        self.queue.threads.configure({"worker-key": agent})
+        thread = self.queue.threads.create("concurrent", max_agent_runs=10)
+        barrier = threading.Barrier(6)
+        results = []
+
+        def post():
+            barrier.wait()
+            results.append(self.queue.threads.post(
+                thread["id"], "user", "@worker-key task: work"
+            ))
+
+        workers = [threading.Thread(target=post) for _ in range(5)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=2)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(len(agent.calls), 1)
+        self.assertEqual(sum(bool(result["replies"]) for result in results), 1)
+        self.assertEqual(self.queue.usage.summary("worker-key")["used"]["runs"], 1)
+
+    def test_usage_is_keyed_by_config_key_not_agent_display_name(self):
+        agent = self.agent("Display Name", plan=UsagePlan("daily", runs=1))
+        self.queue.threads.configure({"worker-key": agent})
+        thread = self.queue.threads.create("keyed")
+
+        first = self.queue.threads.post(thread["id"], "user", "@worker-key task: one")
+        second = self.queue.threads.post(thread["id"], "user", "@worker-key task: two")
+
+        self.assertEqual(len(first["replies"]), 1)
+        self.assertEqual(second["replies"], [])
+        self.assertEqual(self.queue.usage.summary("worker-key")["used"]["runs"], 1)
+        row = self.queue.db.execute("SELECT agent FROM usage_runs").fetchone()
+        self.assertEqual(row["agent"], "worker-key")
+
+    def test_failed_alert_audit_rolls_back_dedup_so_alert_can_retry(self):
+        agent = self.agent(plan=UsagePlan("daily", runs=2, warn_threshold=.5))
+        self.queue.threads.configure({"agent-key": agent})
+        self.queue.db.execute(
+            "CREATE TRIGGER reject_usage_audit BEFORE INSERT ON audit_log "
+            "WHEN NEW.event='usage_warn' BEGIN SELECT RAISE(ABORT, 'reject usage audit'); END"
+        )
+        thread = self.queue.threads.create("alert atomicity")
+
+        result = self.queue.threads.post(thread["id"], "user", "@agent-key task: work")
+
+        self.assertEqual(len(result["replies"]), 1)
+        self.assertEqual(self.queue.db.execute("SELECT COUNT(*) FROM usage_alerts").fetchone()[0], 0)
+        self.assertEqual(self.notifier.calls, [])
+        self.queue.db.execute("DROP TRIGGER reject_usage_audit")
+        run = self.queue.db.execute("SELECT * FROM usage_runs").fetchone()
+        self.queue.usage.record(
+            "agent-key", run_id=run["run_id"], started=run["started"],
+            duration=run["duration"], ok=bool(run["ok"]), usage=None,
+        )
+        self.assertEqual(self.queue.db.execute("SELECT COUNT(*) FROM usage_alerts").fetchone()[0], 1)
+        self.assertEqual(len(self.notifier.calls), 1)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
@@ -21,6 +22,7 @@ MENTION_RE = re.compile(
 ACTION_RE = re.compile(r"(?i)(?<![\w])ACTION_REQUEST\s*:\s*")
 OUTBOUND_ACTIONS = {"push", "merge", "send", "network"}
 SUMMARY_LIMIT = 160
+logger = logging.getLogger(__name__)
 
 
 class Threads:
@@ -232,7 +234,7 @@ class Threads:
             thread = self.get(thread_id)
             if thread["state"] != "active" or self._control_state(key) != "active":
                 return []
-            if not self.queue.usage.can_run(agent.name):
+            if not self.queue.usage.can_run(key):
                 return []
             if thread["agent_runs"] >= thread["max_agent_runs"]:
                 self.queue.audit(
@@ -251,6 +253,7 @@ class Threads:
                     (thread_id, agent.name, "running", started),
                 )
                 run_id = cursor.lastrowid
+                self.queue.usage.begin(key, run_id=run_id, started=started)
                 self.queue.audit("agent_run_start", actor=agent.name, thread_id=thread_id, run_id=run_id)
                 return run_id
 
@@ -262,6 +265,7 @@ class Threads:
 
         result = None
         killed = False
+        finished = False
 
         def finish(status: str, ok: bool, error: str | None, duration: float):
             def update():
@@ -288,19 +292,22 @@ class Threads:
                 finish(
                     status, bool(result.ok and not killed), result.error, result.duration
                 )
+                self._running.pop(run_id, None)
+                finished = True
         except BaseException as exc:
             duration = result.duration if result is not None else self.queue.usage.clock() - started
             finish("error", False, str(exc), duration)
-            self.queue.usage.record(
-                agent, run_id=run_id, started=started, duration=duration,
+            self._record_usage(
+                key, agent, thread_id=thread_id, run_id=run_id, started=started, duration=duration,
                 ok=False, usage=result.usage if result is not None else None,
             )
             raise
         finally:
-            with self._lock:
-                self._running.pop(run_id, None)
-        self.queue.usage.record(
-            agent, run_id=run_id, started=started, duration=result.duration,
+            if not finished:
+                with self._lock:
+                    self._running.pop(run_id, None)
+        self._record_usage(
+            key, agent, thread_id=thread_id, run_id=run_id, started=started, duration=result.duration,
             ok=bool(result.ok and not killed), usage=result.usage,
         )
         if killed:
@@ -323,6 +330,20 @@ class Threads:
                         thread_id, target, mention.group("body"), "agent", agent.name,
                     ))
         return replies
+
+    def _record_usage(self, key: str, agent: Agent, *, thread_id: str, **fields) -> None:
+        """Accounting must never change the observable outcome of an agent run."""
+        try:
+            self.queue.usage.record(key, **fields)
+        except BaseException as exc:
+            logger.exception("failed to record usage for run %s", fields["run_id"])
+            try:
+                self.queue.transaction(lambda: self.queue.audit(
+                    "usage_record_error", actor=agent.name, thread_id=thread_id,
+                    run_id=fields["run_id"], detail={"error": str(exc)},
+                ))
+            except BaseException:
+                logger.exception("failed to audit usage recording failure for run %s", fields["run_id"])
 
     def route(self, task: str, eligible_agents: list[str]) -> dict:
         """Choose the active eligible agent with the greatest quota headroom."""

@@ -302,6 +302,58 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(event["event"], "agent_run_end")
         self.assertEqual(event["detail"]["status"], "error")
 
+    def test_kill_cannot_mark_a_finished_run_as_killing(self):
+        thread = self.queue.threads.create("Kill race")
+        recording = threading.Event()
+        release = threading.Event()
+        real_record = self.queue.usage.record
+
+        def block_record(*args, **kwargs):
+            recording.set()
+            release.wait(timeout=2)
+            return real_record(*args, **kwargs)
+
+        result = {}
+        with mock.patch.object(self.queue.usage, "record", side_effect=block_record):
+            worker = threading.Thread(target=lambda: result.update(
+                self.queue.threads.post(thread["id"], "user", "@Helper task: go")
+            ))
+            worker.start()
+            self.assertTrue(recording.wait(timeout=1))
+            self.queue.threads.kill("Helper")
+            status = self.queue.db.execute("SELECT status FROM agent_runs").fetchone()["status"]
+            release.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(status, "ok")
+        self.assertEqual(len(result["replies"]), 1)
+
+    def test_usage_record_failure_keeps_reply_and_gated_actions(self):
+        self.agent.result = self.agent.result.__class__(
+            'done\nACTION_REQUEST: {"action":"send","summary":"ship it"}',
+            True, None, 0.0, 1,
+        )
+        thread = self.queue.threads.create("Usage failure")
+
+        with mock.patch.object(self.queue.usage, "record", side_effect=RuntimeError("usage down")):
+            result = self.queue.threads.post(thread["id"], "user", "@Helper task: go")
+
+        self.assertEqual(len(result["replies"]), 1)
+        self.assertEqual(len(self.queue.list(status="review")), 1)
+        errors = [row for row in self.queue.threads.audit_log() if row["event"] == "usage_record_error"]
+        self.assertEqual(errors[-1]["detail"]["error"], "usage down")
+
+    def test_usage_record_failure_does_not_mask_original_exception(self):
+        thread = self.queue.threads.create("Original failure")
+        with mock.patch.object(self.queue.threads, "_prompt", side_effect=RuntimeError("prompt failed")), \
+             mock.patch.object(self.queue.usage, "record", side_effect=RuntimeError("usage down")):
+            with self.assertRaisesRegex(RuntimeError, "prompt failed"):
+                self.queue.threads.post(thread["id"], "user", "@Helper task: go")
+        self.assertIn(
+            "usage_record_error", [row["event"] for row in self.queue.threads.audit_log()]
+        )
+
     def test_audit_is_append_only_and_records_messages_runs_and_approval(self):
         thread = self.queue.threads.create("Audit")
         self.queue.threads.post(thread["id"], "user", "@Helper task: go")

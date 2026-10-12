@@ -66,26 +66,41 @@ class UsageMonitor:
     def configure(self, agents: Mapping[str, Agent]) -> None:
         self._agents = {name.casefold(): agent for name, agent in agents.items()}
 
-    def record(self, agent: Agent, *, run_id: int, started: float, duration: float,
+    def begin(self, agent_key: str, *, run_id: int, started: float) -> None:
+        """Reserve a run against quota in the caller's start transaction."""
+        self.queue.db.execute(
+            "INSERT INTO usage_runs(run_id,agent,started,duration,ok,tokens,usage_json) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (run_id, agent_key.casefold(), started, 0.0, 0, None, None),
+        )
+
+    def record(self, agent_key: str, *, run_id: int, started: float, duration: float,
                ok: bool, usage: Mapping | None) -> dict:
+        agent = self._agent(agent_key)
         tokens = token_count(usage)
         serialized = json.dumps(dict(usage), sort_keys=True) if isinstance(usage, Mapping) else None
         self.queue.transaction(lambda: self.queue.db.execute(
-            "INSERT OR REPLACE INTO usage_runs(run_id,agent,started,duration,ok,tokens,usage_json) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (run_id, agent.name, started, max(0.0, duration), int(ok), tokens, serialized),
+            "INSERT INTO usage_runs(run_id,agent,started,duration,ok,tokens,usage_json) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET "
+            "agent=excluded.agent,started=excluded.started,duration=excluded.duration,"
+            "ok=excluded.ok,tokens=excluded.tokens,usage_json=excluded.usage_json",
+            (run_id, agent_key.casefold(), started, max(0.0, duration), int(ok), tokens, serialized),
         ))
-        result = self.summary(agent.name)
-        self._check_thresholds(agent, result)
+        result = self.summary(agent_key)
+        self._check_thresholds(agent_key.casefold(), agent, result)
         return result
+
+    def _agent(self, agent_key: str) -> Agent:
+        agent = self._agents.get(agent_key.casefold())
+        if agent is None:
+            raise ValueError(f"Unknown agent {agent_key}")
+        return agent
 
     def summary(self, agent_name: str | None = None) -> dict | list[dict]:
         if agent_name is not None:
-            agent = self._agents.get(agent_name.casefold())
-            if agent is None:
-                raise ValueError(f"Unknown agent {agent_name}")
-            return self._summary(agent)
-        return [self._summary(agent) for agent in sorted(self._agents.values(), key=lambda a: a.name.casefold())]
+            key = agent_name.casefold()
+            return self._summary(key, self._agent(key))
+        return [self._summary(key, agent) for key, agent in sorted(self._agents.items())]
 
     def can_run(self, agent_name: str) -> bool:
         item = self.summary(agent_name)
@@ -96,12 +111,13 @@ class UsageMonitor:
         candidates = []
         skipped = {}
         for requested in eligible_agents:
-            agent = self._agents.get(requested.casefold())
+            key = requested.casefold()
+            agent = self._agents.get(key)
             if agent is None:
                 skipped[requested] = "unknown"
                 continue
-            state = control_state(agent.name.casefold()) if control_state else "active"
-            item = self._summary(agent)
+            state = control_state(key) if control_state else "active"
+            item = self._summary(key, agent)
             if state != "active":
                 skipped[agent.name] = state
             elif item["blocked"]:
@@ -126,7 +142,7 @@ class UsageMonitor:
             "usage": item,
         }
 
-    def _summary(self, agent: Agent) -> dict:
+    def _summary(self, agent_key: str, agent: Agent) -> dict:
         plan = agent.usage_plan
         if plan is None:
             return {"agent": agent.name, "window": None, "window_start": None,
@@ -138,7 +154,7 @@ class UsageMonitor:
         row = self.queue.db.execute(
             "SELECT COUNT(*) runs,COALESCE(SUM(duration),0) seconds,SUM(tokens) tokens "
             "FROM usage_runs WHERE agent=? COLLATE NOCASE AND started>=? AND started<=?",
-            (agent.name, start, now),
+            (agent_key, start, now),
         ).fetchone()
         used = {"runs": row["runs"], "minutes": row["seconds"] / 60.0, "tokens": row["tokens"]}
         caps = {key: value for key, value in {
@@ -155,7 +171,7 @@ class UsageMonitor:
                 "remaining_fraction": max(0.0, 1.0 - fraction),
                 "blocked": fraction >= plan.blocked_threshold}
 
-    def _check_thresholds(self, agent: Agent, item: dict) -> None:
+    def _check_thresholds(self, agent_key: str, agent: Agent, item: dict) -> None:
         plan = agent.usage_plan
         if plan is None:
             return
@@ -164,23 +180,26 @@ class UsageMonitor:
         if plan.window.endswith("h"):
             self.queue.transaction(lambda: self.queue.db.execute(
                 "DELETE FROM usage_alerts WHERE agent=? AND window_key=? AND at<?",
-                (agent.name.casefold(), item["window_key"], item["window_start"]),
+                (agent_key, item["window_key"], item["window_start"]),
             ))
         levels = (("warn", plan.warn_threshold), ("blocked", plan.blocked_threshold))
         for level, threshold in levels:
             if fraction < threshold:
                 continue
-            inserted = self.queue.transaction(lambda: self.queue.db.execute(
-                "INSERT OR IGNORE INTO usage_alerts(agent,window_key,threshold,at) VALUES(?,?,?,?)",
-                (agent.name.casefold(), item["window_key"], level, self.clock()),
-            ).rowcount)
-            if not inserted:
-                continue
             detail = {"level": level, "window": plan.window,
                       "percent_used": item["percent_used"], "caps": item["caps"]}
-            self.queue.transaction(lambda: self.queue.audit(
-                f"usage_{level}", actor=agent.name, detail=detail
-            ))
+            def insert_and_audit():
+                inserted = self.queue.db.execute(
+                    "INSERT OR IGNORE INTO usage_alerts(agent,window_key,threshold,at) VALUES(?,?,?,?)",
+                    (agent_key, item["window_key"], level, self.clock()),
+                ).rowcount
+                if inserted:
+                    self.queue.audit(f"usage_{level}", actor=agent.name, detail=detail)
+                return inserted
+
+            inserted = self.queue.transaction(insert_and_audit)
+            if not inserted:
+                continue
             self.queue._notify(
                 f"Usage {level}: {agent.name} reached {fraction * 100:.1f}% of its {plan.window} plan",
                 source="hitl-usage",
