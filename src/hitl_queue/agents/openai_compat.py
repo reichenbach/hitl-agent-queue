@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import os
@@ -73,7 +74,10 @@ class OpenAICompatAgent(Agent):
                         current_response.append(response)
                     result = self._read_response(response, started)
                 outcomes.put(result)
-            except (OSError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            except (
+                OSError, http.client.HTTPException, ValueError, KeyError, IndexError,
+                TypeError, json.JSONDecodeError,
+            ) as exc:
                 outcomes.put(AgentResult("", False, str(exc), time.monotonic() - started, None))
             finally:
                 with response_lock:
@@ -126,7 +130,10 @@ class OpenAICompatAgent(Agent):
             output = payload["choices"][0]["message"]["content"]
             if not isinstance(output, str):
                 raise ValueError("response content is not a string")
-        except (OSError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        except (
+            OSError, http.client.HTTPException, ValueError, KeyError, IndexError,
+            TypeError, json.JSONDecodeError,
+        ) as exc:
             return AgentResult("", False, str(exc), time.monotonic() - started, None)
         encoded = output.encode("utf-8")
         truncated = len(encoded) > self.limits.max_output_bytes

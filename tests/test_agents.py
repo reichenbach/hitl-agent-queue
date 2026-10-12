@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import socket
@@ -318,6 +319,26 @@ timeout_seconds = 10
         self.assertFalse(result.ok)
         self.assertEqual(result.error, "timed out")
         self.assertEqual(response.read_calls, 1)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_http_adapter_reports_http_protocol_errors(self, build_opener):
+        errors = (
+            http.client.BadStatusLine("broken status"),
+            http.client.IncompleteRead(b"partial", 4),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                opener = mock.Mock()
+                opener.open.side_effect = error
+                build_opener.return_value = opener
+
+                result = OpenAICompatAgent(
+                    "local", "http://localhost:1234", "model", self.limits
+                ).run("hello", self.root)
+
+                self.assertFalse(result.ok)
+                self.assertEqual(result.error, str(error))
+                self.assertNotEqual(result.error, "timed out")
 
     def test_cli_termination_uses_session_leader_pid_as_process_group(self):
         from hitl_queue.agents.cli import _terminate_process_group

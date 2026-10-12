@@ -149,6 +149,61 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(reviewer.calls, [])
         self.assertEqual(self.queue.threads.audit_log()[-1]["event"], "agent_task_blocked")
 
+    def test_agent_task_with_unknown_output_mention_is_done_and_not_rerun(self):
+        _, reviewer, ticket = self._make_agent_task_ticket()
+        reviewer.result = reviewer.result.__class__(
+            "@Nobody task: investigate", True, None, 0.0, 1
+        )
+
+        first = self.queue.actions.approve(ticket["id"], "CODEX")
+        second = self.queue.actions.approve(ticket["id"], "CODEX")
+
+        self.assertEqual(first["action"], "dispatch_agent_task")
+        self.assertFalse(second["ok"])
+        self.assertEqual(len(reviewer.calls), 1)
+        self.assertEqual(self.queue.get(ticket["id"])["status"], "done")
+        unknown = [
+            row for row in self.queue.threads.audit_log()
+            if row["event"] == "unknown_agent_mention"
+        ]
+        self.assertEqual(unknown[-1]["detail"]["target"], "Nobody")
+
+    def test_post_run_error_marks_agent_task_done_and_audits_error(self):
+        _, reviewer, ticket = self._make_agent_task_ticket()
+        with mock.patch.object(
+            self.queue.threads, "_append_message", side_effect=RuntimeError("append failed")
+        ):
+            result = self.queue.actions.approve(ticket["id"], "CODEX")
+
+        self.assertEqual(result["action"], "dispatch_agent_task")
+        self.assertEqual(len(reviewer.calls), 1)
+        self.assertEqual(self.queue.get(ticket["id"])["status"], "done")
+        errors = [
+            row for row in self.queue.threads.audit_log()
+            if row["event"] == "agent_task_dispatch_error"
+        ]
+        self.assertEqual(errors[-1]["detail"]["error"], "append failed")
+
+    def test_legacy_agent_task_without_thread_id_is_blocked_clearly(self):
+        _, reviewer, ticket = self._make_agent_task_ticket()
+        ticket = self.queue.get(ticket["id"])
+        payload = ticket["payload"]
+        del payload["agent_task"]["thread_id"]
+        self.queue.db.execute(
+            "UPDATE tickets SET payload=? WHERE id=?",
+            (json.dumps(payload), ticket["id"]),
+        )
+
+        result = self.queue.actions.approve(ticket["id"], "CODEX")
+
+        self.assertEqual(result["action"], "agent_task_blocked")
+        self.assertEqual(result["error"], "missing_thread_id")
+        self.assertEqual(self.queue.get(ticket["id"])["status"], "approved")
+        self.assertEqual(reviewer.calls, [])
+        event = self.queue.threads.audit_log()[-1]
+        self.assertEqual(event["event"], "agent_task_blocked")
+        self.assertEqual(event["detail"]["reason"], "missing_thread_id")
+
     def test_thread_run_limit(self):
         thread = self.queue.threads.create("Bounded", max_agent_runs=1)
         self.queue.threads.post(thread["id"], "user", "@Helper task: one")

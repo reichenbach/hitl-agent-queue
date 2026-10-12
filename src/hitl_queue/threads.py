@@ -285,9 +285,15 @@ class Threads:
         if result.ok:
             for mention in MENTION_RE.finditer(result.output):
                 if mention.group("kind").lower() == "task":
+                    target = mention.group("agent")
+                    if target.casefold() not in self._agents:
+                        self.queue.audit(
+                            "unknown_agent_mention", actor=agent.name, thread_id=thread_id,
+                            detail={"target": target, "kind": "task"},
+                        )
+                        continue
                     replies.extend(self._wake(
-                        thread_id, mention.group("agent"), mention.group("body"),
-                        "agent", agent.name,
+                        thread_id, target, mention.group("body"), "agent", agent.name,
                     ))
         return replies
 
@@ -445,14 +451,25 @@ class Threads:
 
     def dispatch_approved_agent_task(self, ticket: dict) -> tuple[list[dict], bool]:
         request = ticket["payload"]["agent_task"]
-        thread_id = request["thread_id"]
+        thread_id = request.get("thread_id")
+        if not thread_id:
+            raise ValueError("missing_thread_id")
         run_started: list[bool] = []
-        replies = self._wake(
-            thread_id,
-            request["target_agent"],
-            request["task"],
-            "user",
-            "human-approval",
-            run_started=run_started,
-        )
+        replies: list[dict] = []
+        try:
+            replies = self._wake(
+                thread_id,
+                request["target_agent"],
+                request["task"],
+                "user",
+                "human-approval",
+                run_started=run_started,
+            )
+        except Exception as exc:
+            if not run_started:
+                raise
+            self.queue.audit(
+                "agent_task_dispatch_error", actor="human", ticket_id=ticket.get("id"),
+                thread_id=thread_id, detail={"error": str(exc)},
+            )
         return replies, bool(run_started)
