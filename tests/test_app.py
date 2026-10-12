@@ -98,7 +98,7 @@ class AppApiTests(_DemoCase):
         tid = self.first("review")
         out = self.api.approve(tid, "codex")
         self.assertEqual(
-            out,
+            {k: v for k, v in out.items() if k != "notification"},
             {"ok": True, "action": "handoff", "id": tid, "worker": "codex", "mode": "review_only"},
         )
         self.assertEqual(self.queue.get(tid)["status"], "handoff")
@@ -109,7 +109,7 @@ class AppApiTests(_DemoCase):
 
     def test_skip_and_rejected_actions(self):
         tid = self.first("review")
-        self.assertEqual(self.api.skip(tid), {"ok": True, "action": "skip", "id": tid})
+        self.assertEqual({k: v for k, v in self.api.skip(tid).items() if k != "notification"}, {"ok": True, "action": "skip", "id": tid})
         self.assertEqual(self.queue.get(tid)["status"], "skipped")
 
         done = self.first("done")
