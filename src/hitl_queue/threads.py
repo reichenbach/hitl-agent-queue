@@ -199,7 +199,14 @@ class Threads:
         return self.queue.transaction(append)
 
     def _wake(
-        self, thread_id: str, name: str, task: str, source_type: str, source_name: str
+        self,
+        thread_id: str,
+        name: str,
+        task: str,
+        source_type: str,
+        source_name: str,
+        *,
+        run_started: list[bool] | None = None,
     ) -> list[dict]:
         key = name.casefold()
         agent = self._agents.get(key)
@@ -245,6 +252,8 @@ class Threads:
                 return run_id
 
             run_id = self.queue.transaction(begin)
+            if run_started is not None:
+                run_started.append(True)
             cancel_event = threading.Event()
             self._running[run_id] = (agent, cancel_event)
         prompt = self._prompt(thread_id, task)
@@ -285,9 +294,10 @@ class Threads:
     def _prompt(self, thread_id: str, task: str) -> str:
         lines = []
         for message in self.messages(thread_id):
-            role = "user" if message["author_type"] == "user" else f"agent:{message['author']}"
+            author = json.dumps(message["author"], ensure_ascii=False)[1:-1]
+            role = "user" if message["author_type"] == "user" else f"agent:{author}"
             body = self._escape_multiline(message["body"])
-            lines.append(f"[{role}] {message['author']}: {body}")
+            lines.append(f"[{role}] {author}: {body}")
         transcript = "\n".join(lines)
         policy = (
             "Do not push, merge, send messages, or make outbound network requests. "
@@ -375,8 +385,18 @@ class Threads:
         if not any(work_dir.is_relative_to(folder.resolve()) for folder in agent.limits.allowed_folders):
             raise ValueError(f"agent {agent.name!r} work_dir must be inside allowed_folders")
         state = self.queue.state
-        if state.is_relative_to(work_dir) or work_dir.is_relative_to(state):
+        if self._contains_directory(state, work_dir) or self._contains_directory(work_dir, state):
             raise ValueError(f"agent {agent.name!r} work_dir must not overlap the state directory")
+
+    @staticmethod
+    def _contains_directory(parent: Path, child: Path) -> bool:
+        """Compare real directory identities, including every child ancestor."""
+        parent_stat = parent.stat()
+        identity = (parent_stat.st_dev, parent_stat.st_ino)
+        return any(
+            (candidate.stat().st_dev, candidate.stat().st_ino) == identity
+            for candidate in (child, *child.parents)
+        )
 
     @staticmethod
     def _sanitize_summary(summary: str) -> str:
@@ -397,7 +417,7 @@ class Threads:
                 "reason": f"Agent request from {agent} in {thread_id}",
                 "artifacts": {},
                 "notes": "",
-                request_type: request,
+                request_type: {**request, "thread_id": thread_id},
             }
             self.queue.db.execute(
                 "INSERT INTO tickets(id,kind,status,title,company,url,owner,payload,created,updated) "
@@ -423,12 +443,16 @@ class Threads:
         )
         return ticket
 
-    def dispatch_approved_agent_task(self, ticket: dict) -> list[dict]:
+    def dispatch_approved_agent_task(self, ticket: dict) -> tuple[list[dict], bool]:
         request = ticket["payload"]["agent_task"]
-        thread_id = next(
-            row["thread_id"] for row in self.audit_log()
-            if row["ticket_id"] == ticket["id"] and row["event"] == "approval_requested"
+        thread_id = request["thread_id"]
+        run_started: list[bool] = []
+        replies = self._wake(
+            thread_id,
+            request["target_agent"],
+            request["task"],
+            "user",
+            "human-approval",
+            run_started=run_started,
         )
-        return self._wake(
-            thread_id, request["target_agent"], request["task"], "user", "human-approval"
-        )
+        return replies, bool(run_started)

@@ -140,13 +140,7 @@ class CliAgent(Agent):
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
-        process_group = os.getpgid(process.pid)
-    except (ProcessLookupError, PermissionError):
-        # The leader may already be reaped while descendants still retain the
-        # group whose id was established from the leader's pid.
-        process_group = process.pid
-    try:
-        os.killpg(process_group, signal.SIGTERM)
+        os.killpg(process.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         pass
     try:
@@ -154,7 +148,7 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         pass
     try:
-        os.killpg(process_group, signal.SIGKILL)
+        os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
     process.wait()

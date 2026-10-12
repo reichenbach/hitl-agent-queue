@@ -96,8 +96,9 @@ configured timeout, and the thread run budget bounds agent-to-agent turns.
 
 Every agent entry must set an explicit `work_dir` inside one of its
 `allowed_folders`. The queue state directory must be outside—and must not
-overlap—any agent work folder. `allowed_folders` validates only the starting
-directory; the approval gate depends on the invoked agent CLI's own sandbox
+overlap—any agent work folder. This includes symlinks in `work_dir` that point
+at the state directory or one of its ancestors. `allowed_folders` validates
+only the starting directory; the approval gate depends on the invoked agent CLI's own sandbox
 and permission settings to prevent filesystem or network access.
 
 Agent-authored `@name task:` mentions require human approval by default and

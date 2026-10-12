@@ -3,7 +3,9 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import queue
 import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -56,34 +58,65 @@ class OpenAICompatAgent(Agent):
         request = urllib.request.Request(
             f"{self.base_url}/v1/chat/completions", data=body, headers=headers, method="POST"
         )
-        try:
+        outcomes: queue.Queue[AgentResult] = queue.Queue(maxsize=1)
+        response_lock = threading.Lock()
+        current_response: list[object] = []
+
+        def perform_request() -> None:
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({}), _NoRedirect()
             )
-            socket_timeout = min(self.limits.timeout_seconds, 0.25)
-            with opener.open(request, timeout=socket_timeout) as response:
-                chunks = []
-                size = 0
-                while size <= self.limits.max_output_bytes:
-                    if cancel_event.is_set():
-                        return AgentResult(
-                            "", False, "cancelled", time.monotonic() - started, 0
-                        )
-                    if time.monotonic() >= deadline:
-                        return AgentResult(
-                            "", False, "timed out", time.monotonic() - started, None
-                        )
-                    try:
-                        chunk = response.read(
-                            min(65536, self.limits.max_output_bytes + 1 - size)
-                        )
-                    except (socket.timeout, TimeoutError):
-                        continue
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    size += len(chunk)
-                raw = b"".join(chunks)
+            try:
+                remaining = max(0.0, deadline - time.monotonic())
+                with opener.open(request, timeout=remaining) as response:
+                    with response_lock:
+                        current_response.append(response)
+                    result = self._read_response(response, started)
+                outcomes.put(result)
+            except (OSError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+                outcomes.put(AgentResult("", False, str(exc), time.monotonic() - started, None))
+            finally:
+                with response_lock:
+                    current_response.clear()
+
+        worker = threading.Thread(target=perform_request, daemon=True)
+        worker.start()
+        while True:
+            try:
+                return outcomes.get_nowait()
+            except queue.Empty:
+                pass
+            if cancel_event.is_set():
+                with response_lock:
+                    if current_response:
+                        current_response[0].close()
+                return AgentResult("", False, "cancelled", time.monotonic() - started, 0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                with response_lock:
+                    if current_response:
+                        current_response[0].close()
+                return AgentResult("", False, "timed out", time.monotonic() - started, None)
+            cancel_event.wait(min(remaining, 0.05))
+
+    def _read_response(self, response, started: float) -> AgentResult:
+        try:
+            chunks = []
+            size = 0
+            while size <= self.limits.max_output_bytes:
+                try:
+                    chunk = response.read(
+                        min(65536, self.limits.max_output_bytes + 1 - size)
+                    )
+                except (socket.timeout, TimeoutError):
+                    return AgentResult(
+                        "", False, "timed out", time.monotonic() - started, None
+                    )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            raw = b"".join(chunks)
             if len(raw) > self.limits.max_output_bytes:
                 return AgentResult(
                     "", False, "response body exceeded max_output_bytes",

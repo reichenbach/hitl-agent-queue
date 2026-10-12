@@ -34,9 +34,28 @@ class Actions:
             }
 
         agent_task = (ticket.get("payload") or {}).get("agent_task")
-        if ticket["status"] == "review" and agent_task:
-            self.queue.approve(tid, actor="human", note="approved agent task")
-            replies = self.queue.threads.dispatch_approved_agent_task(ticket)
+        if ticket["status"] in {"review", "approved"} and agent_task:
+            if ticket["status"] == "review":
+                ticket = self.queue.approve(tid, actor="human", note="approved agent task")
+            try:
+                replies, run_started = self.queue.threads.dispatch_approved_agent_task(ticket)
+            except Exception as exc:
+                replies, run_started = [], False
+                reason = str(exc)
+            else:
+                reason = "no run started"
+            if not run_started:
+                self.queue.audit(
+                    "agent_task_blocked", actor="human", ticket_id=tid,
+                    thread_id=agent_task.get("thread_id"), detail={"reason": reason},
+                )
+                notification = self.queue._notify(
+                    f"{tid} agent task blocked; approval remains retryable", source="hitl-reply"
+                )
+                return {
+                    "ok": False, "action": "agent_task_blocked", "id": tid,
+                    "replies": replies, "error": reason, "notification": notification,
+                }
             self.queue.done(tid, actor="human", note="approved agent task dispatched")
             notification = self.queue._notify(
                 f"OK {tid} agent task dispatched", source="hitl-reply"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,36 @@ class _Response:
             size = len(self.payload)
         chunk, self.payload = self.payload[:size], self.payload[size:]
         return chunk
+
+    def close(self) -> None:
+        pass
+
+
+class _SlowResponse(_Response):
+    def __init__(self) -> None:
+        super().__init__({"choices": [{"message": {"content": "too late"}}]})
+        self.read_started = threading.Event()
+        self.closed = threading.Event()
+
+    def read(self, size=-1) -> bytes:
+        self.read_started.set()
+        self.closed.wait(2)
+        if self.closed.is_set():
+            raise OSError("response closed")
+        return super().read(size)
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+class _ReadTimeoutResponse(_Response):
+    def __init__(self) -> None:
+        super().__init__({})
+        self.read_calls = 0
+
+    def read(self, size=-1) -> bytes:
+        self.read_calls += 1
+        raise socket.timeout("slow read")
 
 
 class _Opener:
@@ -239,7 +270,10 @@ timeout_seconds = 10
         self.assertEqual(result.output, "local answer")
         request, kwargs = opener.calls[0]
         self.assertEqual(request.full_url, "http://192.168.1.20:8000/v1/chat/completions")
-        self.assertEqual(kwargs["timeout"], 0.25)
+        self.assertAlmostEqual(
+            kwargs["timeout"], self.limits.timeout_seconds, delta=0.1
+        )
+        self.assertNotEqual(kwargs["timeout"], 0.25)
         self.assertEqual(
             json.loads(request.data),
             {"model": "test-model", "messages": [{"role": "user", "content": "say hi"}]},
@@ -248,6 +282,57 @@ timeout_seconds = 10
         self.assertIsInstance(proxy_handler, urllib.request.ProxyHandler)
         self.assertEqual(proxy_handler.proxies, {})
         self.assertEqual(redirect_handler.__class__.__name__, "_NoRedirect")
+
+    @mock.patch("urllib.request.build_opener")
+    def test_http_adapter_cancel_closes_slow_response(self, build_opener):
+        response = _SlowResponse()
+        build_opener.return_value = _Opener(response)
+        agent = OpenAICompatAgent(
+            "local", "http://localhost:1234", "model", self.limits
+        )
+        cancel_event = threading.Event()
+        result = {}
+        worker = threading.Thread(
+            target=lambda: result.update(
+                value=agent.run("hello", self.root, cancel_event=cancel_event)
+            )
+        )
+        worker.start()
+        self.assertTrue(response.read_started.wait(1))
+        cancel_event.set()
+        worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(response.closed.is_set())
+        self.assertFalse(result["value"].ok)
+        self.assertEqual(result["value"].error, "cancelled")
+
+    @mock.patch("urllib.request.build_opener")
+    def test_http_adapter_does_not_retry_after_read_timeout(self, build_opener):
+        response = _ReadTimeoutResponse()
+        build_opener.return_value = _Opener(response)
+        result = OpenAICompatAgent(
+            "local", "http://localhost:1234", "model", self.limits
+        ).run("hello", self.root)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "timed out")
+        self.assertEqual(response.read_calls, 1)
+
+    def test_cli_termination_uses_session_leader_pid_as_process_group(self):
+        from hitl_queue.agents.cli import _terminate_process_group
+
+        process = mock.Mock(pid=4321)
+        process.wait.side_effect = [subprocess.TimeoutExpired("test", 1), 0]
+        with mock.patch("hitl_queue.agents.cli.os.killpg") as killpg, mock.patch(
+            "hitl_queue.agents.cli.os.getpgid", create=True
+        ) as getpgid:
+            _terminate_process_group(process)
+        getpgid.assert_not_called()
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(4321, 15), mock.call(4321, 9)],
+        )
 
     @mock.patch("urllib.request.build_opener")
     def test_http_adapter_requires_configured_key(self, build_opener):
