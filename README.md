@@ -174,6 +174,34 @@ open "dist/HITL Queue.app"
 The build is unsigned. The first time you launch it, right-click
 `HITL Queue.app` and choose **Open** to approve it in macOS.
 
+## Tray app
+
+The optional tray/menu-bar app shows review tickets awaiting approval, running
+agents, and quota bars. Approve and Skip operate on the configured public queue;
+**Open app** starts the existing synthetic desktop board in a separate process.
+
+```bash
+pip install -e ".[tray]"
+python3 -m hitl_queue tray                 # uses --state-dir (default: state)
+python3 -m hitl_queue tray --demo          # neutral throwaway demo data only
+```
+
+- **macOS:** `make tray-app`, then `open "dist/HITL Tray.app"`. The unsigned
+  app may require right-clicking it and choosing **Open** once. `LSUIElement` is
+  enabled, so the bundle appears only in the menu bar.
+- **Windows:** install the tray extra and run the command above, or build with
+  `pyinstaller --noconfirm --clean packaging/hitl_tray.spec`; launch
+  `dist/HITL Tray.exe`.
+- **Linux:** install a system tray implementation and GI bindings first. On
+  Debian/Ubuntu: `sudo apt install libappindicator3-dev
+  gir1.2-appindicator3-0.1 python3-gi`. Some desktop environments also require
+  an AppIndicator extension. Build with the same PyInstaller command and launch
+  `dist/HITL Tray`.
+
+The workflow in `.github/workflows/tray-build.yml` builds all three platforms
+and uploads their unsigned artifacts; it can be started manually or by a `v*`
+tag.
+
 ## Optional chat channels
 
 iMessage/Cortland is one option. Slack, Teams, Discord, or any webhook work

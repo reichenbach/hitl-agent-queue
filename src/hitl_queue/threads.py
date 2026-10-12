@@ -360,6 +360,13 @@ class Threads:
         """Choose the active eligible agent with the greatest quota headroom."""
         return self.queue.usage.route(task, eligible_agents, control_state=self._control_state)
 
+    def running(self) -> list[dict]:
+        """Return durable read-model data for agent runs that have not finished."""
+        return [dict(row) for row in self.queue.db.execute(
+            "SELECT id,thread_id,agent,status,started FROM agent_runs "
+            "WHERE status IN ('running','killing') ORDER BY started,id"
+        )]
+
     def _prompt(self, thread_id: str, task: str) -> str:
         lines = []
         for message in self.messages(thread_id):

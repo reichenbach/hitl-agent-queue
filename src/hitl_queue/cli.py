@@ -62,6 +62,12 @@ def cmd_app(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_tray(args: argparse.Namespace) -> int:
+    from .tray import launch
+
+    return launch(state_dir=args.state_dir, demo=args.demo)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="hitl-queue", description=__doc__)
     p.add_argument("--state-dir", default="state")
@@ -97,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--browser", action="store_true", help="Skip pywebview; use the browser")
     s.add_argument("--port", type=int, default=0, help="Browser fallback port (default: random)")
     s.add_argument("--apply-opens", default=None, help="Override demo apply_opens (YYYY-MM-DD)")
+    s = sub.add_parser("tray", help="Run the queue tray/menu-bar app")
+    s.add_argument("--demo", action="store_true", help="Use only the neutral synthetic demo data")
     s = sub.add_parser("done")
     s.add_argument("id")
     s.add_argument("--actor", default="worker")
@@ -111,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_reply_server(args)
     if args.cmd == "app":
         return cmd_app(args)
+    if args.cmd == "tray":
+        return cmd_tray(args)
 
     q = _q(args)
     try:

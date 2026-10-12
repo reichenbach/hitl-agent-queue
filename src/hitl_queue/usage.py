@@ -152,7 +152,7 @@ class UsageMonitor:
             return {"agent": agent.name, "window": None, "window_start": None,
                     "used": {"runs": 0, "minutes": 0.0, "tokens": None},
                     "caps": {}, "percent_used": {}, "remaining_fraction": 1.0,
-                    "blocked": False}
+                    "warn": False, "blocked": False}
         now = self.clock()
         start, key = _window(plan.window, now)
         row = self.queue.db.execute(
@@ -173,6 +173,7 @@ class UsageMonitor:
         return {"agent": agent.name, "window": plan.window, "window_start": start,
                 "window_key": key, "used": used, "caps": caps, "percent_used": percents,
                 "remaining_fraction": max(0.0, 1.0 - fraction),
+                "warn": fraction >= plan.warn_threshold,
                 "blocked": fraction >= plan.blocked_threshold}
 
     def _check_thresholds(self, agent_key: str, agent: Agent, item: dict) -> None:
