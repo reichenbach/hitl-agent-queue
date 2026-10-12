@@ -7,9 +7,18 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class AgentLimits:
+    """Execution limits for an adapter.
+
+    ``allowed_folders`` only validates the starting working directory. It is
+    not a filesystem sandbox and does not prevent a CLI from accessing paths
+    outside those folders. Configure the invoked CLI's own sandbox and
+    permission flags when isolation is required.
+    """
+
     allowed_folders: tuple[Path, ...]
     max_turns: int
     timeout_seconds: float
+    max_output_bytes: int = 1_048_576
 
     def __post_init__(self) -> None:
         if not self.allowed_folders:
@@ -18,6 +27,8 @@ class AgentLimits:
             raise ValueError("max_turns must be at least 1")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than 0")
+        if self.max_output_bytes < 1:
+            raise ValueError("max_output_bytes must be at least 1")
 
 
 @dataclass(frozen=True)
@@ -26,7 +37,8 @@ class AgentResult:
     ok: bool
     error: str | None
     duration: float
-    turns: int
+    turns: int | None
+    truncated: bool = False
 
 
 class Agent(ABC):
@@ -47,7 +59,7 @@ class Agent(ABC):
                 turns=0,
             )
         result = self._run(prompt, folder)
-        if result.turns > self.limits.max_turns:
+        if result.turns is not None and result.turns > self.limits.max_turns:
             return AgentResult(
                 output=result.output,
                 ok=False,
@@ -57,6 +69,7 @@ class Agent(ABC):
                 ),
                 duration=result.duration,
                 turns=result.turns,
+                truncated=result.truncated,
             )
         return result
 

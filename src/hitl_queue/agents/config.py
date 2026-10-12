@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import tomllib
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - exercised on Python 3.10
+    import tomli as tomllib
 from pathlib import Path
 from typing import Any
 
@@ -34,10 +37,23 @@ def _build_agent(name: str, data: Any, base_dir: Path) -> Agent:
         ),
         max_turns=_positive_int(data.get("max_turns"), name, "max_turns"),
         timeout_seconds=_positive_number(data.get("timeout_seconds"), name, "timeout_seconds"),
+        max_output_bytes=_positive_int(
+            data.get("max_output_bytes", 1_048_576), name, "max_output_bytes"
+        ),
     )
     kind = data.get("type")
     if kind == "cli":
-        return CliAgent(name, _string_list(data.get("command"), name, "command"), limits)
+        return CliAgent(
+            name,
+            _string_list(data.get("command"), name, "command"),
+            limits,
+            extra_args=_optional_string_list(data.get("extra_args"), name, "extra_args"),
+            turns_flag=_optional_string(data.get("turns_flag"), name, "turns_flag"),
+            prompt_via=data.get("prompt_via", "stdin"),
+            env_passthrough=_optional_string_list(
+                data.get("env_passthrough"), name, "env_passthrough"
+            ),
+        )
     if kind == "openai_compat":
         return OpenAICompatAgent(
             name,
@@ -54,6 +70,16 @@ def _build_agent(name: str, data: Any, base_dir: Path) -> Agent:
 def _string_list(value: Any, agent: str, field: str) -> list[str]:
     if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
         raise ValueError(f"agent {agent!r} field {field!r} must be a non-empty string list")
+    return value
+
+
+def _optional_string_list(value: Any, agent: str, field: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise ValueError(f"agent {agent!r} field {field!r} must be a string list")
     return value
 
 

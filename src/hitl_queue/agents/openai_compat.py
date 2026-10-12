@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from .base import Agent, AgentLimits, AgentResult
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class OpenAICompatAgent(Agent):
@@ -22,6 +29,7 @@ class OpenAICompatAgent(Agent):
         super().__init__(name, limits)
         if not base_url or not model:
             raise ValueError("base_url and model are required")
+        _validate_base_url(base_url)
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key_env = api_key_env
@@ -44,11 +52,47 @@ class OpenAICompatAgent(Agent):
             f"{self.base_url}/v1/chat/completions", data=body, headers=headers, method="POST"
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.limits.timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            opener = urllib.request.build_opener(_NoRedirect)
+            with opener.open(request, timeout=self.limits.timeout_seconds) as response:
+                raw = response.read()
+            payload = json.loads(raw.decode("utf-8"))
             output = payload["choices"][0]["message"]["content"]
             if not isinstance(output, str):
                 raise ValueError("response content is not a string")
         except (OSError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            return AgentResult("", False, str(exc), time.monotonic() - started, 1)
-        return AgentResult(output, True, None, time.monotonic() - started, 1)
+            return AgentResult("", False, str(exc), time.monotonic() - started, None)
+        encoded = output.encode("utf-8")
+        truncated = len(encoded) > self.limits.max_output_bytes
+        if truncated:
+            output = encoded[:self.limits.max_output_bytes].decode("utf-8", errors="ignore")
+        return AgentResult(output, True, None, time.monotonic() - started, None, truncated)
+
+
+def _validate_base_url(base_url: str) -> None:
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("base_url must be an absolute http(s) URL")
+    if parsed.scheme == "https":
+        return
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".local"):
+        return
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        raise ValueError("base_url must use https unless its host is local or a private address")
+    private_networks = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("fc00::/7"),
+    )
+    if not (
+        address.is_loopback
+        or address.is_link_local
+        or any(
+            address.version == network.version and address in network
+            for network in private_networks
+        )
+    ):
+        raise ValueError("base_url must use https unless its host is local or a private address")

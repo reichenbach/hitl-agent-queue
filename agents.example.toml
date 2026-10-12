@@ -1,15 +1,24 @@
-# Relative allowed_folders are resolved from this file's directory.
+# Relative allowed_folders are resolved from this file's directory. This only
+# checks the CLI's starting cwd; it does not sandbox filesystem access. Use
+# extra_args for the selected CLI's own sandbox and permission flags.
 
 [agents.claude]
 type = "cli"
 command = ["claude", "-p"]
+prompt_via = "arg"
+extra_args = []
+# turns_flag = "--max-turns" # If supported, receives max_turns as its value.
+# env_passthrough = ["ANTHROPIC_API_KEY"] # Added to the minimal default env.
 allowed_folders = ["."]
 max_turns = 12
 timeout_seconds = 900
+max_output_bytes = 1048576
 
 [agents.codex]
 type = "cli"
 command = ["codex", "exec"]
+prompt_via = "arg"
+extra_args = [] # For example, the CLI's own sandbox/approval flags.
 allowed_folders = ["."]
 max_turns = 12
 timeout_seconds = 900
@@ -17,6 +26,7 @@ timeout_seconds = 900
 [agents.generic]
 type = "cli"
 command = ["agent", "--trust"]
+prompt_via = "stdin"
 allowed_folders = ["."]
 max_turns = 12
 timeout_seconds = 900
