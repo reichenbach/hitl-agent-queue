@@ -19,19 +19,16 @@ class FakeAgent(Agent):
         duration: float = 0.0,
         turns: int = 1,
         delay_seconds: float = 0.0,
+        work_dir: str | Path | None = None,
+        allow_agent_to_agent: bool = False,
     ) -> None:
-        super().__init__(name, limits)
+        super().__init__(name, limits, work_dir=work_dir, allow_agent_to_agent=allow_agent_to_agent)
         self.result = AgentResult(output, ok, error, duration, turns)
         self.calls: list[tuple[str, Path]] = []
         self.delay_seconds = delay_seconds
-        self._cancelled = threading.Event()
 
-    def _run(self, prompt: str, cwd: Path) -> AgentResult:
-        self._cancelled.clear()
+    def _run(self, prompt: str, cwd: Path, cancel_event: threading.Event) -> AgentResult:
         self.calls.append((prompt, cwd))
-        if self.delay_seconds and self._cancelled.wait(self.delay_seconds):
+        if self.delay_seconds and cancel_event.wait(self.delay_seconds):
             return AgentResult("", False, "cancelled", 0.0, 0)
         return self.result
-
-    def cancel(self) -> None:
-        self._cancelled.set()

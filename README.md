@@ -94,6 +94,16 @@ queue.threads.post(thread["id"], "user", "@codex fyi: no action needed")
 `kill` accept an agent name or no name for all agents. Each adapter keeps its
 configured timeout, and the thread run budget bounds agent-to-agent turns.
 
+Every agent entry must set an explicit `work_dir` inside one of its
+`allowed_folders`. The queue state directory must be outside—and must not
+overlap—any agent work folder. `allowed_folders` validates only the starting
+directory; the approval gate depends on the invoked agent CLI's own sandbox
+and permission settings to prevent filesystem or network access.
+
+Agent-authored `@name task:` mentions require human approval by default and
+self-tasking is always rejected. Set `allow_agent_to_agent = true` on the
+target agent, or on a thread at creation time, only when that relay is wanted.
+
 Agents cannot directly request irreversible or outbound work. They emit one
 JSON line, which creates a normal ticket in `review` for the existing
 approve/skip flow:

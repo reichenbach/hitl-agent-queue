@@ -24,8 +24,10 @@ class CliAgent(Agent):
         turns_flag: str | None = None,
         prompt_via: str = "stdin",
         env_passthrough: Sequence[str] = (),
+        work_dir: str | Path | None = None,
+        allow_agent_to_agent: bool = False,
     ) -> None:
-        super().__init__(name, limits)
+        super().__init__(name, limits, work_dir=work_dir, allow_agent_to_agent=allow_agent_to_agent)
         if not command or not all(isinstance(part, str) and part for part in command):
             raise ValueError("command must be a non-empty list of strings")
         self.command = tuple(command)
@@ -42,15 +44,16 @@ class CliAgent(Agent):
         self.prompt_via = prompt_via
         self.env_passthrough = tuple(env_passthrough)
         self._process_lock = threading.Lock()
-        self._process: subprocess.Popen[bytes] | None = None
+        self._processes: dict[threading.Event, subprocess.Popen[bytes]] = {}
 
-    def cancel(self) -> None:
+    def cancel(self, cancel_event: threading.Event) -> None:
         with self._process_lock:
-            process = self._process
+            cancel_event.set()
+            process = self._processes.get(cancel_event)
         if process is not None:
             _terminate_process_group(process)
 
-    def _run(self, prompt: str, cwd: Path) -> AgentResult:
+    def _run(self, prompt: str, cwd: Path, cancel_event: threading.Event) -> AgentResult:
         started = time.monotonic()
         argv = [*self.command, *self.extra_args]
         if self.turns_flag:
@@ -63,7 +66,12 @@ class CliAgent(Agent):
         env = {key: value for key, value in os.environ.items() if key in allowed_env}
         process = None
         workers: tuple[threading.Thread, ...] = ()
+        stdout_capture = _BoundedCapture(self.limits.max_output_bytes)
+        stderr_capture = _BoundedCapture(self.limits.max_output_bytes)
         try:
+            with self._process_lock:
+                if cancel_event.is_set():
+                    return AgentResult("", False, "cancelled", time.monotonic() - started, 0)
             process = subprocess.Popen(
                 argv,
                 cwd=cwd,
@@ -74,10 +82,12 @@ class CliAgent(Agent):
                 start_new_session=True,
             )
             with self._process_lock:
-                self._process = process
+                self._processes[cancel_event] = process
+                cancelled = cancel_event.is_set()
+            if cancelled:
+                _terminate_process_group(process)
+                return AgentResult("", False, "cancelled", time.monotonic() - started, 0)
             assert process.stdout is not None and process.stderr is not None
-            stdout_capture = _BoundedCapture(self.limits.max_output_bytes)
-            stderr_capture = _BoundedCapture(self.limits.max_output_bytes)
             readers = (
                 threading.Thread(target=stdout_capture.drain, args=(process.stdout,)),
                 threading.Thread(target=stderr_capture.drain, args=(process.stderr,)),
@@ -102,8 +112,8 @@ class CliAgent(Agent):
             if process is not None:
                 _terminate_process_group(process)
             with self._process_lock:
-                if self._process is process:
-                    self._process = None
+                if self._processes.get(cancel_event) is process:
+                    del self._processes[cancel_event]
             for worker in workers:
                 worker.join()
         output, truncated = stdout_capture.result()

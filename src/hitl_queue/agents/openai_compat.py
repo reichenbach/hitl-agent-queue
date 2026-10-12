@@ -25,8 +25,11 @@ class OpenAICompatAgent(Agent):
         model: str,
         limits: AgentLimits,
         api_key_env: str | None = None,
+        *,
+        work_dir: str | Path | None = None,
+        allow_agent_to_agent: bool = False,
     ) -> None:
-        super().__init__(name, limits)
+        super().__init__(name, limits, work_dir=work_dir, allow_agent_to_agent=allow_agent_to_agent)
         if not base_url or not model:
             raise ValueError("base_url and model are required")
         _validate_base_url(base_url)
@@ -34,7 +37,7 @@ class OpenAICompatAgent(Agent):
         self.model = model
         self.api_key_env = api_key_env
 
-    def _run(self, prompt: str, cwd: Path) -> AgentResult:
+    def _run(self, prompt: str, cwd: Path, cancel_event) -> AgentResult:
         started = time.monotonic()
         body = json.dumps(
             {"model": self.model, "messages": [{"role": "user", "content": prompt}]}

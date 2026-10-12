@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
@@ -66,6 +67,7 @@ turns_flag = "--max-turns"
 prompt_via = "arg"
 env_passthrough = ["SPECIAL_TOKEN"]
 allowed_folders = ["work"]
+work_dir = "work"
 max_turns = 3
 timeout_seconds = 4.5
 max_output_bytes = 1234
@@ -76,6 +78,7 @@ base_url = "http://localhost:1234/"
 model = "local-model"
 api_key_env = "TEST_AGENT_KEY"
 allowed_folders = ["."]
+work_dir = "."
 max_turns = 1
 timeout_seconds = 10
 """
@@ -102,6 +105,26 @@ timeout_seconds = 10
         self.assertFalse(result.ok)
         self.assertIn("limit is 2", result.error)
         self.assertEqual(result.turns, 3)
+
+    def test_fake_concurrent_runs_have_independent_cancellation(self):
+        agent = FakeAgent("fake", self.limits, output="done", delay_seconds=0.1)
+        cancelled = threading.Event()
+        continuing = threading.Event()
+        results = {}
+        first = threading.Thread(
+            target=lambda: results.update(first=agent.run("one", self.root, cancel_event=cancelled))
+        )
+        second = threading.Thread(
+            target=lambda: results.update(second=agent.run("two", self.root, cancel_event=continuing))
+        )
+        first.start()
+        second.start()
+        agent.cancel(cancelled)
+        first.join()
+        second.join()
+        self.assertFalse(results["first"].ok)
+        self.assertEqual(results["first"].error, "cancelled")
+        self.assertTrue(results["second"].ok)
 
     def test_cli_arg_prompt_is_delimited_and_has_devnull_stdin(self):
         script = "import sys; print(sys.argv[1:]); print(sys.stdin.read() == '')"

@@ -150,6 +150,7 @@ class Queue:
                     check_same_thread=False,
                 )
                 connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA recursive_triggers=ON")
                 self._connections.db = connection
                 self._all_connections.add(connection)
         return connection
@@ -397,25 +398,27 @@ class Queue:
 
     def approve(self, tid: str, *, actor: str = "human", note: str = "") -> dict:
         def action():
-            return self._set(tid, "approved", actor, note or "approved")
+            ticket = self._set(tid, "approved", actor, note or "approved")
+            self.audit(
+                "approval", actor=actor, ticket_id=tid,
+                detail={"decision": "approve", "note": note or "approved"},
+            )
+            return ticket
 
         ticket = self.transaction(action)
-        self.audit(
-            "approval", actor=actor, ticket_id=tid,
-            detail={"decision": "approve", "note": note or "approved"},
-        )
         self._ping(ticket, "approved", detail=note or actor)
         return ticket
 
     def skip(self, tid: str, *, actor: str = "human", note: str = "") -> dict:
         def action():
-            return self._set(tid, "skipped", actor, note or "skipped")
+            ticket = self._set(tid, "skipped", actor, note or "skipped")
+            self.audit(
+                "approval", actor=actor, ticket_id=tid,
+                detail={"decision": "skip", "note": note or "skipped"},
+            )
+            return ticket
 
         ticket = self.transaction(action)
-        self.audit(
-            "approval", actor=actor, ticket_id=tid,
-            detail={"decision": "skip", "note": note or "skipped"},
-        )
         self._ping(ticket, "skipped", detail=note or actor)
         return ticket
 
@@ -433,6 +436,10 @@ class Queue:
                 (json.dumps(payload, sort_keys=True), time.time(), tid),
             )
             self._event(tid, job["status"], "human", f"preferred_worker={worker}")
+            self.audit(
+                "approval", actor="human", ticket_id=tid,
+                detail={"decision": "prefer_worker", "worker": worker},
+            )
             return self.get(tid)
 
         return self.transaction(action)

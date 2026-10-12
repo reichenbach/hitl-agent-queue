@@ -18,8 +18,9 @@ if TYPE_CHECKING:
 MENTION_RE = re.compile(
     r"(?im)(?:^|\s)@(?P<agent>[A-Za-z][\w.-]*)\s+(?P<kind>task|fyi)\s*:\s*(?P<body>[^\n]*)"
 )
-ACTION_RE = re.compile(r"(?m)^ACTION_REQUEST:\s*(\{.*\})\s*$")
+ACTION_RE = re.compile(r"(?i)(?<![\w])ACTION_REQUEST\s*:\s*")
 OUTBOUND_ACTIONS = {"push", "merge", "send", "network"}
+SUMMARY_LIMIT = 160
 
 
 class Threads:
@@ -28,7 +29,7 @@ class Threads:
     def __init__(self, queue: Queue):
         self.queue = queue
         self._agents: dict[str, Agent] = {}
-        self._running: dict[int, Agent] = {}
+        self._running: dict[int, tuple[Agent, threading.Event]] = {}
         self._lock = threading.RLock()
         self.queue.db.executescript(
             """
@@ -38,6 +39,7 @@ class Threads:
               max_agent_runs INTEGER NOT NULL CHECK(max_agent_runs > 0),
               agent_runs INTEGER NOT NULL DEFAULT 0,
               state TEXT NOT NULL DEFAULT 'active',
+              allow_agent_to_agent INTEGER NOT NULL DEFAULT 0,
               created REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS thread_messages(
@@ -82,10 +84,23 @@ class Threads:
             BEFORE DELETE ON audit_log BEGIN
               SELECT RAISE(ABORT, 'audit_log is append-only');
             END;
+            CREATE TRIGGER IF NOT EXISTS audit_log_monotonic_seq
+            BEFORE INSERT ON audit_log
+            WHEN NEW.seq != -1 AND NEW.seq <= COALESCE((SELECT MAX(seq) FROM audit_log), 0)
+            BEGIN
+              SELECT RAISE(ABORT, 'audit_log sequence must increase');
+            END;
             """
         )
+        columns = {row["name"] for row in self.queue.db.execute("PRAGMA table_info(threads)")}
+        if "allow_agent_to_agent" not in columns:
+            self.queue.db.execute(
+                "ALTER TABLE threads ADD COLUMN allow_agent_to_agent INTEGER NOT NULL DEFAULT 0"
+            )
 
     def configure(self, agents: dict[str, Agent]) -> None:
+        for agent in agents.values():
+            self._validate_work_dir(agent)
         self._agents = {name.casefold(): agent for name, agent in agents.items()}
 
     def configure_from(self, path: str | Path = "agents.toml") -> None:
@@ -94,11 +109,15 @@ class Threads:
 
         self.configure(load_agents(path))
 
-    def create(self, title: str, *, max_agent_runs: int = 12) -> dict:
+    def create(
+        self, title: str, *, max_agent_runs: int = 12, allow_agent_to_agent: bool = False
+    ) -> dict:
         if not title.strip():
             raise ValueError("thread title required")
         if not isinstance(max_agent_runs, int) or max_agent_runs < 1:
             raise ValueError("max_agent_runs must be a positive integer")
+        if not isinstance(allow_agent_to_agent, bool):
+            raise ValueError("allow_agent_to_agent must be a boolean")
 
         def insert():
             row = self.queue.db.execute("SELECT value FROM meta WHERE key='next_thread_seq'").fetchone()
@@ -109,8 +128,8 @@ class Threads:
             )
             thread_id = f"THR-{number:04d}"
             self.queue.db.execute(
-                "INSERT INTO threads(id,title,max_agent_runs,created) VALUES(?,?,?,?)",
-                (thread_id, title.strip(), max_agent_runs, time.time()),
+                "INSERT INTO threads(id,title,max_agent_runs,allow_agent_to_agent,created) VALUES(?,?,?,?,?)",
+                (thread_id, title.strip(), max_agent_runs, int(allow_agent_to_agent), time.time()),
             )
             return self.get(thread_id)
 
@@ -143,6 +162,8 @@ class Threads:
         return rows
 
     def post(self, thread_id: str, author: str, body: str, *, cwd: str | Path | None = None) -> dict:
+        if cwd is not None:
+            raise ValueError("cwd overrides are not allowed; configure each agent work_dir")
         thread = self.get(thread_id)
         if thread["state"] != "active":
             raise ValueError(f"{thread_id} is {thread['state']}")
@@ -152,35 +173,60 @@ class Threads:
             if mention.group("kind").lower() == "fyi":
                 continue
             replies.extend(self._wake(
-                thread_id, mention.group("agent"), mention.group("body"), cwd
+                thread_id, mention.group("agent"), mention.group("body"), "user", author
             ))
         return {"message": message, "replies": replies}
 
     def _append_message(self, thread_id: str, author_type: str, author: str, body: str) -> dict:
         if not body.strip():
             raise ValueError("message body required")
-        cursor = self.queue.db.execute(
-            "INSERT INTO thread_messages(thread_id,author_type,author,body,created) VALUES(?,?,?,?,?)",
-            (thread_id, author_type, author, body, time.time()),
-        )
-        message_id = cursor.lastrowid
-        self.queue.audit(
-            "message", actor=author, thread_id=thread_id, message_id=message_id,
-            detail={"author_type": author_type, "body": body},
-        )
-        return dict(self.queue.db.execute("SELECT * FROM thread_messages WHERE id=?", (message_id,)).fetchone())
+        def append():
+            cursor = self.queue.db.execute(
+                "INSERT INTO thread_messages(thread_id,author_type,author,body,created) VALUES(?,?,?,?,?)",
+                (thread_id, author_type, author, body, time.time()),
+            )
+            message_id = cursor.lastrowid
+            self.queue.audit(
+                "message", actor=author, thread_id=thread_id, message_id=message_id,
+                detail={"author_type": author_type, "body": body},
+            )
+            return dict(self.queue.db.execute(
+                "SELECT * FROM thread_messages WHERE id=?", (message_id,)
+            ).fetchone())
+        return self.queue.transaction(append)
 
-    def _wake(self, thread_id: str, name: str, task: str, cwd: str | Path | None) -> list[dict]:
+    def _wake(
+        self, thread_id: str, name: str, task: str, source_type: str, source_name: str
+    ) -> list[dict]:
         key = name.casefold()
         agent = self._agents.get(key)
         if agent is None:
             raise ValueError(f"Unknown agent {name}")
+        if source_type == "agent":
+            if key == source_name.casefold():
+                self.queue.audit(
+                    "agent_task_rejected", actor=source_name, thread_id=thread_id,
+                    detail={"reason": "self_task", "target": agent.name},
+                )
+                return []
+            thread = self.get(thread_id)
+            if not (thread["allow_agent_to_agent"] or agent.allow_agent_to_agent):
+                self._create_approval_ticket(
+                    thread_id, source_name, "agent_task",
+                    f"Allow {source_name} to task {agent.name}: {task}",
+                    {"target_agent": agent.name, "task": task},
+                )
+                return []
         with self._lock:
             thread = self.get(thread_id)
             if thread["state"] != "active" or self._control_state(key) != "active":
                 return []
             if thread["agent_runs"] >= thread["max_agent_runs"]:
-                raise ValueError(f"{thread_id} agent run limit reached")
+                self.queue.audit(
+                    "agent_run_limit", actor=source_name, thread_id=thread_id,
+                    detail={"limit": thread["max_agent_runs"], "target": agent.name},
+                )
+                return []
             started = time.time()
 
             def begin():
@@ -196,10 +242,11 @@ class Threads:
                 return run_id
 
             run_id = self.queue.transaction(begin)
-            self._running[run_id] = agent
+            cancel_event = threading.Event()
+            self._running[run_id] = (agent, cancel_event)
         prompt = self._prompt(thread_id, task)
         try:
-            result = agent.run(prompt, cwd or self.queue.state)
+            result = agent.run(prompt, agent.work_dir, cancel_event=cancel_event)
         except BaseException as exc:
             from .agents import AgentResult
             result = AgentResult("", False, str(exc), time.time() - started, None)
@@ -207,14 +254,16 @@ class Threads:
             self._running.pop(run_id, None)
             killed = self._run_status(run_id) == "killing"
             status = "killed" if killed else ("ok" if result.ok else "error")
-            self.queue.db.execute(
-                "UPDATE agent_runs SET status=?,ended=?,ok=?,error=?,duration=? WHERE id=?",
-                (status, time.time(), int(result.ok and not killed), result.error, result.duration, run_id),
-            )
-            self.queue.audit(
-                "agent_run_end", actor=agent.name, thread_id=thread_id, run_id=run_id,
-                detail={"status": status, "ok": bool(result.ok and not killed), "error": result.error, "duration": result.duration},
-            )
+            def finish():
+                self.queue.db.execute(
+                    "UPDATE agent_runs SET status=?,ended=?,ok=?,error=?,duration=? WHERE id=?",
+                    (status, time.time(), int(result.ok and not killed), result.error, result.duration, run_id),
+                )
+                self.queue.audit(
+                    "agent_run_end", actor=agent.name, thread_id=thread_id, run_id=run_id,
+                    detail={"status": status, "ok": bool(result.ok and not killed), "error": result.error, "duration": result.duration},
+                )
+            self.queue.transaction(finish)
         if killed:
             return []
         reply = self._append_message(thread_id, "agent", agent.name, result.output or result.error or "")
@@ -225,12 +274,18 @@ class Threads:
             for mention in MENTION_RE.finditer(result.output):
                 if mention.group("kind").lower() == "task":
                     replies.extend(self._wake(
-                        thread_id, mention.group("agent"), mention.group("body"), cwd
+                        thread_id, mention.group("agent"), mention.group("body"),
+                        "agent", agent.name,
                     ))
         return replies
 
     def _prompt(self, thread_id: str, task: str) -> str:
-        transcript = "\n".join(f"{m['author']}: {m['body']}" for m in self.messages(thread_id))
+        lines = []
+        for message in self.messages(thread_id):
+            role = "user" if message["author_type"] == "user" else f"agent:{message['author']}"
+            body = message["body"].replace("\r", "").replace("\n", "\n  ")
+            lines.append(f"[{role}] {message['author']}: {body}")
+        transcript = "\n".join(lines)
         policy = (
             "Do not push, merge, send messages, or make outbound network requests. "
             "To request one of those actions, emit exactly one line in this form: "
@@ -242,57 +297,53 @@ class Threads:
     def _gate_action_requests(self, thread_id: str, agent: str, output: str) -> None:
         for match in ACTION_RE.finditer(output):
             try:
-                request = json.loads(match.group(1))
+                request, _ = json.JSONDecoder().raw_decode(output, match.end())
             except json.JSONDecodeError as exc:
-                raise ValueError(f"invalid ACTION_REQUEST JSON: {exc}") from exc
-            action = request.get("action")
+                self.queue.audit(
+                    "action_request_parse_error", actor=agent, thread_id=thread_id,
+                    detail={"error": str(exc)},
+                )
+                continue
+            action = request.get("action") if isinstance(request, dict) else None
             if action not in OUTBOUND_ACTIONS or not isinstance(request.get("summary"), str):
-                raise ValueError("ACTION_REQUEST needs action push|merge|send|network and summary")
-            ticket = self.queue.enqueue(
-                title=f"Approve {action}: {request['summary']}", kind="task",
-                reason=f"Agent action request from {agent} in {thread_id}", actor=agent,
-            )
-            self.queue.claim(ticket["id"], agent)
-            reviewed = self.queue.submit_draft(
-                ticket["id"], actor=agent, note="outbound action requires human approval"
-            )
-            payload = reviewed["payload"]
-            payload["action_request"] = request
-            self.queue.db.execute(
-                "UPDATE tickets SET payload=?,updated=? WHERE id=?",
-                (json.dumps(payload, sort_keys=True), time.time(), ticket["id"]),
-            )
-            self.queue.audit(
-                "approval_requested", actor=agent, thread_id=thread_id,
-                ticket_id=ticket["id"], detail=request,
+                self.queue.audit("action_request_parse_error", actor=agent, thread_id=thread_id,
+                                 detail={"error": "invalid action or summary"})
+                continue
+            request["summary"] = self._sanitize_summary(request["summary"])
+            self._create_approval_ticket(
+                thread_id, agent, "action_request",
+                f"Approve {action}: {request['summary']}", request,
             )
 
     def pause(self, agent: str | None = None) -> None:
-        self._set_control(agent, "paused")
+        self._set_control(agent, "paused", "pause")
 
     def resume(self, agent: str | None = None) -> None:
-        self._set_control(agent, "active")
+        self._set_control(agent, "active", "resume")
 
     def kill(self, agent: str | None = None) -> None:
-        self._set_control(agent, "killed")
+        self._set_control(agent, "killed", "kill")
         key = agent.casefold() if agent else None
         with self._lock:
-            targets = [(run_id, runner) for run_id, runner in self._running.items()
+            targets = [(run_id, runner, event) for run_id, (runner, event) in self._running.items()
                        if key is None or runner.name.casefold() == key]
-            for run_id, runner in targets:
+            for run_id, runner, event in targets:
                 self.queue.db.execute("UPDATE agent_runs SET status='killing' WHERE id=?", (run_id,))
-                runner.cancel()
+                runner.cancel(event)
 
-    def _set_control(self, agent: str | None, state: str) -> None:
-        if agent is None:
-            self.queue.db.execute(
-                "INSERT OR REPLACE INTO meta(key,value) VALUES('all_agents_state',?)", (state,)
-            )
-        else:
-            self.queue.db.execute(
-                "INSERT OR REPLACE INTO agent_controls(agent,state) VALUES(?,?)",
-                (agent.casefold(), state),
-            )
+    def _set_control(self, agent: str | None, state: str, event: str) -> None:
+        def change():
+            if agent is None:
+                self.queue.db.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('all_agents_state',?)", (state,)
+                )
+            else:
+                self.queue.db.execute(
+                    "INSERT OR REPLACE INTO agent_controls(agent,state) VALUES(?,?)",
+                    (agent.casefold(), state),
+                )
+            self.queue.audit(event, actor="human", detail={"agent": agent or "all"})
+        self.queue.transaction(change)
 
     def _control_state(self, agent: str) -> str:
         row = self.queue.db.execute("SELECT value FROM meta WHERE key='all_agents_state'").fetchone()
@@ -303,3 +354,55 @@ class Threads:
 
     def _run_status(self, run_id: int) -> str:
         return self.queue.db.execute("SELECT status FROM agent_runs WHERE id=?", (run_id,)).fetchone()["status"]
+
+    def _validate_work_dir(self, agent: Agent) -> None:
+        work_dir = agent.work_dir
+        if work_dir is None:
+            raise ValueError(f"agent {agent.name!r} requires an explicit work_dir")
+        if not work_dir.is_dir():
+            raise ValueError(f"agent {agent.name!r} work_dir is not a directory: {work_dir}")
+        if not any(work_dir.is_relative_to(folder.resolve()) for folder in agent.limits.allowed_folders):
+            raise ValueError(f"agent {agent.name!r} work_dir must be inside allowed_folders")
+        state = self.queue.state
+        if any(state.is_relative_to(folder.resolve()) for folder in agent.limits.allowed_folders):
+            raise ValueError(f"agent {agent.name!r} allowed_folders must not contain the state directory")
+        if state.is_relative_to(work_dir) or work_dir.is_relative_to(state):
+            raise ValueError(f"agent {agent.name!r} work_dir must not overlap the state directory")
+
+    @staticmethod
+    def _sanitize_summary(summary: str) -> str:
+        summary = re.sub(r"[\x00-\x1f\x7f]+", " ", summary)
+        summary = re.sub(r"\s+", " ", summary).strip()
+        summary = re.sub(r"(?i)\b(APPROVE|SKIP)(?=\s+TKT-)", r"\1_", summary)
+        return summary[:SUMMARY_LIMIT] or "(no summary)"
+
+    def _create_approval_ticket(
+        self, thread_id: str, agent: str, request_type: str, title: str, request: dict
+    ) -> dict:
+        clean_title = self._sanitize_summary(title)
+
+        def create():
+            ticket_id = self.queue._next_id()
+            stamp = time.time()
+            payload = {
+                "reason": f"Agent request from {agent} in {thread_id}",
+                "artifacts": {},
+                "notes": "",
+                request_type: request,
+            }
+            self.queue.db.execute(
+                "INSERT INTO tickets(id,kind,status,title,company,url,owner,payload,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (ticket_id, "task", "review", clean_title, "", None, agent,
+                 json.dumps(payload, sort_keys=True), stamp, stamp),
+            )
+            self.queue._event(ticket_id, "new", agent, payload["reason"])
+            self.queue._event(ticket_id, "drafting", agent, "claimed by agent")
+            self.queue._event(ticket_id, "review", agent, "requires human approval")
+            self.queue.audit(
+                "approval_requested", actor=agent, thread_id=thread_id,
+                ticket_id=ticket_id, detail={"type": request_type, **request},
+            )
+            return self.queue.get(ticket_id)
+
+        return self.queue.transaction(create)

@@ -41,6 +41,13 @@ def _build_agent(name: str, data: Any, base_dir: Path) -> Agent:
             data.get("max_output_bytes", 1_048_576), name, "max_output_bytes"
         ),
     )
+    work_value = _required_string(data.get("work_dir"), name, "work_dir")
+    work_dir = (Path(work_value) if Path(work_value).is_absolute() else base_dir / work_value).resolve()
+    if not any(work_dir.is_relative_to(folder) for folder in limits.allowed_folders):
+        raise ValueError(f"agent {name!r} work_dir must be inside allowed_folders")
+    allow_agent_to_agent = data.get("allow_agent_to_agent", False)
+    if not isinstance(allow_agent_to_agent, bool):
+        raise ValueError(f"agent {name!r} field 'allow_agent_to_agent' must be a boolean")
     kind = data.get("type")
     if kind == "cli":
         return CliAgent(
@@ -53,6 +60,8 @@ def _build_agent(name: str, data: Any, base_dir: Path) -> Agent:
             env_passthrough=_optional_string_list(
                 data.get("env_passthrough"), name, "env_passthrough"
             ),
+            work_dir=work_dir,
+            allow_agent_to_agent=allow_agent_to_agent,
         )
     if kind == "openai_compat":
         return OpenAICompatAgent(
@@ -61,9 +70,14 @@ def _build_agent(name: str, data: Any, base_dir: Path) -> Agent:
             _required_string(data.get("model"), name, "model"),
             limits,
             _optional_string(data.get("api_key_env"), name, "api_key_env"),
+            work_dir=work_dir,
+            allow_agent_to_agent=allow_agent_to_agent,
         )
     if kind == "fake":
-        return FakeAgent(name, limits, output=str(data.get("output", "")))
+        return FakeAgent(
+            name, limits, output=str(data.get("output", "")), work_dir=work_dir,
+            allow_agent_to_agent=allow_agent_to_agent,
+        )
     raise ValueError(f"agent {name!r} has unsupported type {kind!r}")
 
 
