@@ -32,8 +32,10 @@ class OpenAICompatAgent(Agent):
         *,
         work_dir: str | Path | None = None,
         allow_agent_to_agent: bool = False,
+        usage_plan=None,
     ) -> None:
-        super().__init__(name, limits, work_dir=work_dir, allow_agent_to_agent=allow_agent_to_agent)
+        super().__init__(name, limits, work_dir=work_dir, allow_agent_to_agent=allow_agent_to_agent,
+                         usage_plan=usage_plan)
         if not base_url or not model:
             raise ValueError("base_url and model are required")
         _validate_base_url(base_url)
@@ -139,7 +141,10 @@ class OpenAICompatAgent(Agent):
         truncated = len(encoded) > self.limits.max_output_bytes
         if truncated:
             output = encoded[:self.limits.max_output_bytes].decode("utf-8", errors="ignore")
-        return AgentResult(output, True, None, time.monotonic() - started, None, truncated)
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            usage = None
+        return AgentResult(output, True, None, time.monotonic() - started, None, truncated, usage)
 
 
 def _validate_base_url(base_url: str) -> None:

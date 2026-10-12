@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -26,8 +28,12 @@ class CliAgent(Agent):
         env_passthrough: Sequence[str] = (),
         work_dir: str | Path | None = None,
         allow_agent_to_agent: bool = False,
+        usage_plan=None,
+        usage_regex: str | None = None,
+        usage_json_field: str | None = None,
     ) -> None:
-        super().__init__(name, limits, work_dir=work_dir, allow_agent_to_agent=allow_agent_to_agent)
+        super().__init__(name, limits, work_dir=work_dir, allow_agent_to_agent=allow_agent_to_agent,
+                         usage_plan=usage_plan)
         if not command or not all(isinstance(part, str) and part for part in command):
             raise ValueError("command must be a non-empty list of strings")
         self.command = tuple(command)
@@ -43,6 +49,8 @@ class CliAgent(Agent):
         self.turns_flag = turns_flag
         self.prompt_via = prompt_via
         self.env_passthrough = tuple(env_passthrough)
+        self.usage_regex = re.compile(usage_regex) if usage_regex else None
+        self.usage_json_field = usage_json_field
         self._process_lock = threading.Lock()
         self._processes: dict[threading.Event, subprocess.Popen[bytes]] = {}
 
@@ -135,7 +143,29 @@ class CliAgent(Agent):
             duration=time.monotonic() - started,
             turns=None,
             truncated=truncated,
+            usage=self._parse_usage(output),
         )
+
+    def _parse_usage(self, output: str) -> dict | None:
+        if self.usage_regex:
+            match = self.usage_regex.search(output)
+            if match:
+                try:
+                    groups = match.groupdict()
+                    if groups:
+                        return {key: int(value) for key, value in groups.items() if value is not None}
+                    return {"total_tokens": int(match.group(1))}
+                except (ValueError, IndexError):
+                    return None
+        if self.usage_json_field:
+            try:
+                value = json.loads(output)
+                for part in self.usage_json_field.split("."):
+                    value = value[part]
+                return value if isinstance(value, dict) else {"total_tokens": int(value)}
+            except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
+                return None
+        return None
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:

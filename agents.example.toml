@@ -16,6 +16,18 @@ work_dir = "workspaces/claude"
 max_turns = 12
 timeout_seconds = 900
 max_output_bytes = 1048576
+# Optional CLI usage extraction. Named regex groups such as total_tokens,
+# input_tokens and output_tokens are stored; alternatively point at a JSON field.
+# usage_regex = 'tokens: (?P<total_tokens>\d+)'
+# usage_json_field = "usage"
+
+[agents.claude.plan]
+window = "5h" # rolling; "daily" and "weekly" are also supported
+runs = 40
+minutes = 240
+tokens = 1000000
+warn_threshold = 0.8
+blocked_threshold = 1.0
 
 [agents.codex]
 type = "cli"

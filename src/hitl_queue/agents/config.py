@@ -7,7 +7,7 @@ except ImportError:  # pragma: no cover - exercised on Python 3.10
 from pathlib import Path
 from typing import Any
 
-from .base import Agent, AgentLimits
+from .base import Agent, AgentLimits, UsagePlan
 from .cli import CliAgent
 from .fake import FakeAgent
 from .openai_compat import OpenAICompatAgent
@@ -48,6 +48,7 @@ def _build_agent(name: str, data: Any, base_dir: Path) -> Agent:
     allow_agent_to_agent = data.get("allow_agent_to_agent", False)
     if not isinstance(allow_agent_to_agent, bool):
         raise ValueError(f"agent {name!r} field 'allow_agent_to_agent' must be a boolean")
+    usage_plan = _usage_plan(data.get("plan"), name)
     kind = data.get("type")
     if kind == "cli":
         return CliAgent(
@@ -62,6 +63,9 @@ def _build_agent(name: str, data: Any, base_dir: Path) -> Agent:
             ),
             work_dir=work_dir,
             allow_agent_to_agent=allow_agent_to_agent,
+            usage_plan=usage_plan,
+            usage_regex=_optional_string(data.get("usage_regex"), name, "usage_regex"),
+            usage_json_field=_optional_string(data.get("usage_json_field"), name, "usage_json_field"),
         )
     if kind == "openai_compat":
         return OpenAICompatAgent(
@@ -72,11 +76,13 @@ def _build_agent(name: str, data: Any, base_dir: Path) -> Agent:
             _optional_string(data.get("api_key_env"), name, "api_key_env"),
             work_dir=work_dir,
             allow_agent_to_agent=allow_agent_to_agent,
+            usage_plan=usage_plan,
         )
     if kind == "fake":
         return FakeAgent(
             name, limits, output=str(data.get("output", "")), work_dir=work_dir,
             allow_agent_to_agent=allow_agent_to_agent,
+            usage_plan=usage_plan,
         )
     raise ValueError(f"agent {name!r} has unsupported type {kind!r}")
 
@@ -119,3 +125,33 @@ def _positive_number(value: Any, agent: str, field: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"agent {agent!r} field {field!r} must be a positive number")
     return float(value)
+
+
+def _usage_plan(value: Any, agent: str) -> UsagePlan | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"agent {agent!r} field 'plan' must be a table")
+    allowed = {"window", "runs", "minutes", "tokens", "warn_threshold", "blocked_threshold"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"agent {agent!r} plan has unknown fields: {', '.join(sorted(unknown))}")
+    try:
+        return UsagePlan(
+            window=_required_string(value.get("window"), agent, "plan.window"),
+            runs=_optional_positive_int(value.get("runs"), agent, "plan.runs"),
+            minutes=_optional_positive_number(value.get("minutes"), agent, "plan.minutes"),
+            tokens=_optional_positive_int(value.get("tokens"), agent, "plan.tokens"),
+            warn_threshold=float(value.get("warn_threshold", 0.8)),
+            blocked_threshold=float(value.get("blocked_threshold", 1.0)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"agent {agent!r} invalid usage plan: {exc}") from exc
+
+
+def _optional_positive_int(value: Any, agent: str, field: str) -> int | None:
+    return None if value is None else _positive_int(value, agent, field)
+
+
+def _optional_positive_number(value: Any, agent: str, field: str) -> float | None:
+    return None if value is None else _positive_number(value, agent, field)

@@ -30,7 +30,7 @@ from .queue import DEFAULT_CONFIG, TRANSITIONS, Queue, apply_gate_open
 BOARD_STATUSES = ["new", "drafting", "review", "approved", "handoff", "done"]
 SIDE_LANE_STATUSES = ["blocked", "skipped", "cancelled"]
 APPROVABLE = {"new", "drafting", "review", "approved"}
-API_METHODS = ("board", "ticket", "approve", "skip", "set_mute")
+API_METHODS = ("board", "ticket", "approve", "skip", "set_mute", "usage")
 PREVIEW_BYTES = 4000
 MAX_BODY_BYTES = 1024 * 1024
 PAGE = Path(__file__).with_name("app.html")
@@ -200,7 +200,12 @@ class AppApi:
             "counts": self._queue.count_by_status(),
             "gate": self.gate(),
             "notifier": self.notifier(),
+            "usage": self.usage(),
         }
+
+    def usage(self) -> list[dict]:
+        """Small read-only API used by app clients."""
+        return self._queue.usage.summary()
 
     def ticket(self, ticket_id: str) -> dict:
         try:

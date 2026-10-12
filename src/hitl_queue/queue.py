@@ -68,7 +68,8 @@ def apply_gate_open(cfg: dict | None = None, *, today: date | None = None) -> bo
 
 
 class Queue:
-    def __init__(self, state_dir: Path, *, config: dict | None = None, notifier=None):
+    def __init__(self, state_dir: Path, *, config: dict | None = None, notifier=None,
+                 usage_clock=None):
         self.state = Path(state_dir).resolve()
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.cfg = config or dict(DEFAULT_CONFIG)
@@ -106,8 +107,10 @@ class Queue:
         # Imported lazily to keep the action layer independent of construction.
         from .actions import Actions
         from .threads import Threads
+        from .usage import UsageMonitor
 
         self.actions = Actions(self)
+        self.usage = UsageMonitor(self, **({"clock": usage_clock} if usage_clock else {}))
         self.threads = Threads(self)
 
     def audit(

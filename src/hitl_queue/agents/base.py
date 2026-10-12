@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 import threading
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,36 @@ class AgentResult:
     duration: float
     turns: int | None
     truncated: bool = False
+    usage: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class UsagePlan:
+    """Manually configured quota window and optional caps."""
+
+    window: str
+    runs: int | None = None
+    minutes: float | None = None
+    tokens: int | None = None
+    warn_threshold: float = 0.8
+    blocked_threshold: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.window not in {"daily", "weekly"} and not self.window.endswith("h"):
+            raise ValueError("usage window must be 'daily', 'weekly', or a rolling value such as '5h'")
+        if self.window.endswith("h"):
+            try:
+                hours = float(self.window[:-1])
+            except ValueError as exc:
+                raise ValueError("rolling usage window must be a positive number followed by 'h'") from exc
+            if hours <= 0:
+                raise ValueError("rolling usage window must be positive")
+        if all(cap is None for cap in (self.runs, self.minutes, self.tokens)):
+            raise ValueError("usage plan requires at least one cap")
+        if any(cap is not None and cap <= 0 for cap in (self.runs, self.minutes, self.tokens)):
+            raise ValueError("usage caps must be positive")
+        if not 0 < self.warn_threshold <= self.blocked_threshold:
+            raise ValueError("usage thresholds must satisfy 0 < warn <= blocked")
 
 
 class Agent(ABC):
@@ -50,6 +81,7 @@ class Agent(ABC):
         *,
         work_dir: str | Path | None = None,
         allow_agent_to_agent: bool = False,
+        usage_plan: UsagePlan | None = None,
     ) -> None:
         if not name:
             raise ValueError("agent name cannot be empty")
@@ -57,6 +89,7 @@ class Agent(ABC):
         self.limits = limits
         self.work_dir = Path(work_dir).expanduser().resolve() if work_dir is not None else None
         self.allow_agent_to_agent = allow_agent_to_agent
+        self.usage_plan = usage_plan
 
     def run(
         self, prompt: str, cwd: str | Path, *, cancel_event: threading.Event | None = None
@@ -85,6 +118,7 @@ class Agent(ABC):
                 duration=result.duration,
                 turns=result.turns,
                 truncated=result.truncated,
+                usage=result.usage,
             )
         return result
 

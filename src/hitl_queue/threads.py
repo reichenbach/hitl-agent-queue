@@ -105,6 +105,7 @@ class Threads:
         for agent in agents.values():
             self._validate_work_dir(agent)
         self._agents = {name.casefold(): agent for name, agent in agents.items()}
+        self.queue.usage.configure(agents)
 
     def configure_from(self, path: str | Path = "agents.toml") -> None:
         """Load adapters using the public ``hitl_queue.agents`` configuration."""
@@ -231,13 +232,15 @@ class Threads:
             thread = self.get(thread_id)
             if thread["state"] != "active" or self._control_state(key) != "active":
                 return []
+            if not self.queue.usage.can_run(agent.name):
+                return []
             if thread["agent_runs"] >= thread["max_agent_runs"]:
                 self.queue.audit(
                     "agent_run_limit", actor=source_name, thread_id=thread_id,
                     detail={"limit": thread["max_agent_runs"], "target": agent.name},
                 )
                 return []
-            started = time.time()
+            started = self.queue.usage.clock()
 
             def begin():
                 self.queue.db.execute(
@@ -278,7 +281,7 @@ class Threads:
                 result = agent.run(prompt, agent.work_dir, cancel_event=cancel_event)
             except BaseException as exc:
                 from .agents import AgentResult
-                result = AgentResult("", False, str(exc), time.time() - started, None)
+                result = AgentResult("", False, str(exc), self.queue.usage.clock() - started, None)
             with self._lock:
                 killed = self._run_status(run_id) == "killing"
                 status = "killed" if killed else ("ok" if result.ok else "error")
@@ -286,12 +289,20 @@ class Threads:
                     status, bool(result.ok and not killed), result.error, result.duration
                 )
         except BaseException as exc:
-            duration = result.duration if result is not None else time.time() - started
+            duration = result.duration if result is not None else self.queue.usage.clock() - started
             finish("error", False, str(exc), duration)
+            self.queue.usage.record(
+                agent, run_id=run_id, started=started, duration=duration,
+                ok=False, usage=result.usage if result is not None else None,
+            )
             raise
         finally:
             with self._lock:
                 self._running.pop(run_id, None)
+        self.queue.usage.record(
+            agent, run_id=run_id, started=started, duration=result.duration,
+            ok=bool(result.ok and not killed), usage=result.usage,
+        )
         if killed:
             return []
         reply = self._append_message(thread_id, "agent", agent.name, result.output or result.error or "")
@@ -312,6 +323,10 @@ class Threads:
                         thread_id, target, mention.group("body"), "agent", agent.name,
                     ))
         return replies
+
+    def route(self, task: str, eligible_agents: list[str]) -> dict:
+        """Choose the active eligible agent with the greatest quota headroom."""
+        return self.queue.usage.route(task, eligible_agents, control_state=self._control_state)
 
     def _prompt(self, thread_id: str, task: str) -> str:
         lines = []

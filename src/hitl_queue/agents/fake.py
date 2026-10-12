@@ -21,9 +21,12 @@ class FakeAgent(Agent):
         delay_seconds: float = 0.0,
         work_dir: str | Path | None = None,
         allow_agent_to_agent: bool = False,
+        usage_plan=None,
+        usage=None,
     ) -> None:
-        super().__init__(name, limits, work_dir=work_dir, allow_agent_to_agent=allow_agent_to_agent)
-        self.result = AgentResult(output, ok, error, duration, turns)
+        super().__init__(name, limits, work_dir=work_dir, allow_agent_to_agent=allow_agent_to_agent,
+                         usage_plan=usage_plan)
+        self.result = AgentResult(output, ok, error, duration, turns, usage=usage)
         self.calls: list[tuple[str, Path]] = []
         self.delay_seconds = delay_seconds
 

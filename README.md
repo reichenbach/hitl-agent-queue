@@ -117,6 +117,36 @@ Allowed action names are `push`, `merge`, `send`, and `network`. Messages,
 run start/end results and durations, and approval decisions are copied into
 an append-only `audit_log` table.
 
+### Usage plans and routing
+
+Each completed thread run is also recorded in local SQLite with its start,
+duration, outcome, and adapter-reported token usage. Unknown token counts stay
+unknown. Add an optional plan to an agent in `agents.toml`:
+
+```toml
+[agents.codex.plan]
+window = "5h" # rolling; or "daily" / "weekly" (UTC)
+runs = 40
+minutes = 240
+tokens = 1000000
+warn_threshold = 0.8
+blocked_threshold = 1.0
+```
+
+Caps may be omitted independently. Warnings go through the normal notifier
+(and respect mute), are audited once per threshold/window, and runs stop at
+the blocked threshold. CLI adapters may set `usage_regex` (named token groups
+are supported) or `usage_json_field`; OpenAI-compatible adapters read common
+response usage fields automatically.
+
+```python
+queue.usage.summary()  # per-agent app/read API data
+queue.threads.route("summarize changes", ["codex", "claude"])
+```
+
+The router skips paused, killed, and quota-blocked agents, then chooses the
+greatest remaining quota headroom with agent-name tie breaking.
+
 ## Desktop board (demo data)
 
 ```bash

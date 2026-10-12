@@ -1,6 +1,6 @@
 """Adapters for running local and OpenAI-compatible agents."""
 
-from .base import Agent, AgentLimits, AgentResult
+from .base import Agent, AgentLimits, AgentResult, UsagePlan
 from .cli import CliAgent
 from .config import load_agents
 from .fake import FakeAgent
@@ -10,6 +10,7 @@ __all__ = [
     "Agent",
     "AgentLimits",
     "AgentResult",
+    "UsagePlan",
     "CliAgent",
     "FakeAgent",
     "OpenAICompatAgent",
