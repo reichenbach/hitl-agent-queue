@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .agents import Agent
+from .text import sanitize_summary
 from .usage import UsageNotifyError
 
 if TYPE_CHECKING:
@@ -477,10 +478,7 @@ class Threads:
 
     @staticmethod
     def _sanitize_summary(summary: str) -> str:
-        summary = re.sub(r"[\x00-\x1f\x7f]+", " ", summary)
-        summary = re.sub(r"\s+", " ", summary).strip()
-        summary = re.sub(r"(?i)\b(APPROVE|SKIP)(?=\s+TKT-)", r"\1_", summary)
-        return summary[:SUMMARY_LIMIT] or "(no summary)"
+        return sanitize_summary(summary, limit=SUMMARY_LIMIT)
 
     def _create_approval_ticket(
         self, thread_id: str, agent: str, request_type: str, title: str, request: dict

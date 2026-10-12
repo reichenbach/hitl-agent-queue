@@ -1,8 +1,9 @@
 import unittest
 from unittest import mock
+import sys
 
 from hitl_queue.cli import main
-from hitl_queue.tray import TrayModel, usage_bar
+from hitl_queue.tray import TrayModel, schedule_on_main_thread, usage_bar
 
 
 class FakeActions:
@@ -96,6 +97,36 @@ class TrayModelTests(unittest.TestCase):
         next(item for item in self.model.items if item.text == "Open app").action()
         self.assertEqual(self.launched, [True])
 
+    def test_ticket_title_is_single_line_bounded_and_strips_bidi_controls(self):
+        self.queue.tickets[0]["title"] = "  Review\nthis\u0085\u202e " + "x" * 80
+        self.model.refresh()
+        label = self.section("Pending approvals").children[0].text
+        self.assertNotIn("\n", label)
+        self.assertNotIn("\u202e", label)
+        self.assertNotIn("\u0085", label)
+        self.assertTrue(label.endswith("…"))
+        self.assertLessEqual(len(label.removeprefix("TKT-0001 — ")), 60)
+
+    def test_windows_menu_title_escapes_ampersands(self):
+        self.queue.tickets[0]["title"] = "Research & review"
+        with mock.patch.object(sys, "platform", "win32"):
+            self.model.refresh()
+        self.assertIn("Research && review", self.section("Pending approvals").children[0].text)
+
+    def test_action_failure_survives_successful_refresh(self):
+        self.queue.actions.approve = mock.Mock(return_value={"ok": False, "error": "denied"})
+        self.section("Pending approvals").children[0].children[0].action()
+        self.model.refresh()
+        self.assertEqual(self.model.action_error, "denied")
+        self.assertIsNone(self.model.refresh_error)
+        self.assertIn("Error: denied", [item.text for item in self.model.items])
+
+    def test_main_thread_scheduler_is_direct_off_macos(self):
+        called = []
+        with mock.patch.object(sys, "platform", "linux"):
+            schedule_on_main_thread(lambda: called.append(True))
+        self.assertEqual(called, [True])
+
     def test_usage_bar_clamps_and_rounds(self):
         self.assertEqual(usage_bar(-1), "[----------]")
         self.assertEqual(usage_bar(52), "[#####-----]")
@@ -105,6 +136,11 @@ class TrayModelTests(unittest.TestCase):
         with mock.patch("hitl_queue.tray.launch", return_value=0) as launch:
             self.assertEqual(main(["--state-dir", "public-state", "tray", "--demo"]), 0)
         launch.assert_called_once_with(state_dir="public-state", demo=True)
+
+    def test_cli_tray_accepts_state_dir_after_subcommand(self):
+        with mock.patch("hitl_queue.tray.launch", return_value=0) as launch:
+            self.assertEqual(main(["tray", "--state-dir", "public-state"]), 0)
+        launch.assert_called_once_with(state_dir="public-state", demo=False)
 
 
 if __name__ == "__main__":

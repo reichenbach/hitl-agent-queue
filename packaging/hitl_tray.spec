@@ -30,9 +30,8 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="HITL Tray",
     debug=False,
     bootloader_ignore_signals=False,
@@ -45,9 +44,19 @@ exe = EXE(
     entitlements_file=None,
 )
 
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="HITL Tray",
+)
+
 if sys.platform == "darwin":
     app = BUNDLE(
-        exe,
+        coll,
         name="HITL Tray.app",
         icon=None,
         bundle_identifier="com.hitlagentqueue.tray",

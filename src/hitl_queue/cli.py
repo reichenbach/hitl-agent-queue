@@ -70,7 +70,7 @@ def cmd_tray(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="hitl-queue", description=__doc__)
-    p.add_argument("--state-dir", default="state")
+    p.add_argument("--state-dir", dest="global_state_dir", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("demo", help="Run a synthetic end-to-end demo")
@@ -105,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--apply-opens", default=None, help="Override demo apply_opens (YYYY-MM-DD)")
     s = sub.add_parser("tray", help="Run the queue tray/menu-bar app")
     s.add_argument("--demo", action="store_true", help="Use only the neutral synthetic demo data")
+    s.add_argument("--state-dir", default=None, help="Queue state directory")
     s = sub.add_parser("done")
     s.add_argument("id")
     s.add_argument("--actor", default="worker")
@@ -113,6 +114,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("id")
 
     args = p.parse_args(argv)
+    if args.cmd == "tray":
+        args.state_dir = args.state_dir or args.global_state_dir
+    else:
+        args.state_dir = args.global_state_dir or "state"
     if args.cmd == "demo":
         return cmd_demo(args)
     if args.cmd == "reply-server":

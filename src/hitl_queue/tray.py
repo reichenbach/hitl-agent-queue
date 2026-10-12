@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .queue import Queue
+from .text import sanitize_summary
 
 
 @dataclass(frozen=True)
@@ -41,13 +42,26 @@ class TrayModel:
         self.queue = queue
         self.app_launcher = app_launcher or launch_desktop_app
         self.on_change = on_change
-        self.last_error: str | None = None
+        self._lock = threading.RLock()
+        self._refresh_error: str | None = None
+        self._action_error: str | None = None
         self._items: tuple[TrayItem, ...] = ()
         self.refresh()
 
     @property
     def items(self) -> tuple[TrayItem, ...]:
-        return self._items
+        with self._lock:
+            return self._items
+
+    @property
+    def refresh_error(self) -> str | None:
+        with self._lock:
+            return self._refresh_error
+
+    @property
+    def action_error(self) -> str | None:
+        with self._lock:
+            return self._action_error
 
     def refresh(self) -> tuple[TrayItem, ...]:
         """Re-read all state. Errors become a menu row instead of killing polling."""
@@ -55,9 +69,9 @@ class TrayModel:
             approvals = self._approval_items()
             running = self._running_items()
             usage = self._usage_items()
-            self.last_error = None
+            refresh_error = None
         except Exception as exc:
-            self.last_error = str(exc)
+            refresh_error = str(exc)
             approvals = running = usage = ()
 
         sections: list[TrayItem] = [
@@ -65,22 +79,30 @@ class TrayModel:
             TrayItem("Running agents", children=running or (self._empty("None"),)),
             TrayItem("Usage", children=usage or (self._empty("No usage plans"),)),
         ]
-        if self.last_error:
-            sections.append(self._empty(f"Error: {self.last_error}"))
+        with self._lock:
+            self._refresh_error = refresh_error
+            errors = tuple(error for error in (self._action_error, refresh_error) if error)
+        for error in errors:
+            sections.append(self._empty(f"Error: {error}"))
         sections.extend((
             TrayItem("Open app", self.open_app),
             TrayItem("Refresh", self.refresh),
             TrayItem("Quit"),
         ))
-        self._items = tuple(sections)
-        return self._items
+        with self._lock:
+            self._items = tuple(sections)
+            return self._items
 
     def _approval_items(self) -> tuple[TrayItem, ...]:
         items = []
         for ticket in self.queue.list(status="review"):
             worker = self._worker_for(ticket["id"])
+            title = sanitize_summary(
+                ticket["title"], limit=60, ellipsis=True,
+                escape_ampersand=sys.platform == "win32",
+            )
             items.append(TrayItem(
-                f"{ticket['id']} — {ticket['title']}",
+                f"{ticket['id']} — {title}",
                 children=(
                     TrayItem(f"Approve → {worker}", self._approve(ticket["id"], worker)),
                     TrayItem("Skip", self._skip(ticket["id"])),
@@ -122,8 +144,16 @@ class TrayModel:
     def _run_action(self, action: Callable, *args) -> object:
         try:
             result = action(*args)
+            if isinstance(result, dict) and result.get("ok") is False:
+                error = result.get("error") or result.get("message") or "action failed"
+                with self._lock:
+                    self._action_error = str(error)
+            else:
+                with self._lock:
+                    self._action_error = None
         except Exception as exc:
-            self.last_error = str(exc)
+            with self._lock:
+                self._action_error = str(exc)
             result = None
         self.refresh()
         if self.on_change:
@@ -171,15 +201,25 @@ def make_icon_image(size: int = 64):
 class TrayApplication:
     """Thin pystray adapter with a background polling loop."""
 
-    def __init__(self, model: TrayModel, *, poll_interval: float = 5.0) -> None:
+    def __init__(
+        self,
+        model: TrayModel,
+        *,
+        poll_interval: float = 5.0,
+        schedule_update: Callable[[Callable[[], None]], object] | None = None,
+        join_timeout: float = 2.0,
+    ) -> None:
         import pystray
 
         self.pystray = pystray
         self.model = model
         self.poll_interval = poll_interval
+        self.schedule_update = schedule_update or schedule_on_main_thread
+        self.join_timeout = join_timeout
         self.stopped = threading.Event()
+        self.poll_thread: threading.Thread | None = None
         self.icon = pystray.Icon("hitl-queue", make_icon_image(), "HITL Queue")
-        self.model.on_change = self.update_menu
+        self.model.on_change = self.request_menu_update
         self.update_menu()
 
     def _menu(self, items: Sequence[TrayItem]):
@@ -208,22 +248,58 @@ class TrayApplication:
         if getattr(self.icon, "visible", False):
             self.icon.update_menu()
 
+    def request_menu_update(self) -> object:
+        return self.schedule_update(self.update_menu)
+
     def _poll(self) -> None:
         while not self.stopped.wait(self.poll_interval):
             self.model.refresh()
-            self.update_menu()
+            self.request_menu_update()
         self.model.queue.close_thread()
 
     def quit(self, _icon=None, _item=None) -> None:
         self.stopped.set()
+        thread = self.poll_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(self.join_timeout)
         self.icon.stop()
 
     def run(self) -> None:
-        threading.Thread(target=self._poll, name="hitl-tray-poll", daemon=True).start()
-        self.icon.run()
+        self.poll_thread = threading.Thread(
+            target=self._poll, name="hitl-tray-poll", daemon=True
+        )
+        self.poll_thread.start()
+        try:
+            self.icon.run()
+        finally:
+            self.stopped.set()
+            self.poll_thread.join(self.join_timeout)
 
 
-def launch(*, state_dir: str | Path = "state", demo: bool = False) -> int:
+def schedule_on_main_thread(callback: Callable[[], None]) -> object:
+    """Marshal Cocoa UI work to its main loop when PyObjC provides a helper."""
+    if sys.platform == "darwin":
+        try:
+            from PyObjCTools import AppHelper
+
+            return AppHelper.callAfter(callback)
+        except (ImportError, AttributeError):
+            pass
+    return callback()
+
+
+def user_data_dir() -> Path:
+    """Return the platform's conventional per-user application data directory."""
+    import os
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "HITL Queue"
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "HITL Queue"
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "hitl-queue"
+
+
+def launch(*, state_dir: str | Path | None = None, demo: bool = False) -> int:
     """Run the tray against public state, or existing synthetic demo data."""
     temporary = tempfile.TemporaryDirectory(prefix="hitl-tray-demo-") if demo else None
     if demo:
@@ -232,8 +308,12 @@ def launch(*, state_dir: str | Path = "state", demo: bool = False) -> int:
         queue = OutboxQueue(Path(temporary.name), config=demo_config())
         seed_demo(queue)
     else:
-        queue = Queue(Path(state_dir))
-        agents_file = Path("agents.toml")
+        frozen_dir = user_data_dir() if getattr(sys, "frozen", False) else None
+        resolved_state = Path(state_dir) if state_dir is not None else (
+            frozen_dir / "state" if frozen_dir else Path("state")
+        )
+        queue = Queue(resolved_state)
+        agents_file = frozen_dir / "agents.toml" if frozen_dir else Path("agents.toml")
         if agents_file.is_file():
             queue.threads.configure_from(agents_file)
     try:
