@@ -74,6 +74,8 @@ class Queue:
         self.cfg = config or dict(DEFAULT_CONFIG)
         self.notifier = notifier or get_notifier()
         self._connections = threading.local()
+        self._connections_lock = threading.Lock()
+        self._all_connections: set[sqlite3.Connection] = set()
         self.db.executescript(
             """
             PRAGMA journal_mode=WAL;
@@ -110,18 +112,26 @@ class Queue:
     def db(self) -> sqlite3.Connection:
         """Return this thread's connection; Queue instances can be shared safely."""
         connection = getattr(self._connections, "db", None)
-        if connection is None:
-            connection = sqlite3.connect(
-                self.state / "queue.sqlite3", timeout=30, isolation_level=None
-            )
-            connection.row_factory = sqlite3.Row
-            self._connections.db = connection
+        with self._connections_lock:
+            if connection not in self._all_connections:
+                connection = sqlite3.connect(
+                    self.state / "queue.sqlite3",
+                    timeout=30,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                connection.row_factory = sqlite3.Row
+                self._connections.db = connection
+                self._all_connections.add(connection)
         return connection
 
     def close(self) -> None:
-        connection = getattr(self._connections, "db", None)
-        if connection is not None:
+        with self._connections_lock:
+            connections = tuple(self._all_connections)
+            self._all_connections.clear()
+        for connection in connections:
             connection.close()
+        if hasattr(self._connections, "db"):
             del self._connections.db
 
     def _notify(self, text: str, *, source: str) -> dict:
@@ -129,7 +139,7 @@ class Queue:
             self.notifier,
             text,
             source=source,
-            mute=bool(self.cfg.get("mute_notifications", False)),
+            mute=self.cfg.get("mute_notifications"),
         )
 
     def transaction(self, fn):

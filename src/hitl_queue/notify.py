@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -10,6 +11,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Protocol
+
+logger = logging.getLogger(__name__)
 
 PROGRESS_LABELS = {
     "new": "queued",
@@ -47,7 +50,7 @@ def dispatch(
     try:
         result = dict(notifier.notify(text, source=source) or {})
     except Exception as exc:
-        return {
+        result = {
             "channel": notifier.__class__.__name__.removesuffix("Notifier").lower(),
             "ok": False,
             "error": str(exc),
@@ -55,6 +58,13 @@ def dispatch(
     result.setdefault("channel", notifier.__class__.__name__.removesuffix("Notifier").lower())
     result["ok"] = bool(result.get("ok"))
     result.setdefault("error", None)
+    if not result["ok"]:
+        logger.warning(
+            "notification dispatch failed channel=%s source=%s error=%s",
+            result["channel"],
+            source,
+            result["error"],
+        )
     return result
 
 

@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from hitl_queue.queue import Queue
 from hitl_queue.notify import StdoutNotifier, progress_text
@@ -51,7 +52,28 @@ class QueueTests(unittest.TestCase):
 
         other = self.q.enqueue(title="Direct skip", company="Acme")
         out = self.q.actions.skip(other["id"])
-        self.assertEqual(out, {"ok": True, "action": "skip", "id": other["id"]})
+        self.assertEqual(out["action"], "skip")
+        self.assertEqual(out["id"], other["id"])
+        self.assertTrue(out["notification"]["ok"])
+
+    def test_action_responses_include_failed_notification(self):
+        notifier = mock.Mock()
+        notifier.notify.return_value = {
+            "ok": False,
+            "channel": "test",
+            "error": "offline",
+        }
+        ticket = self.q.enqueue(title="Cannot notify", company="Acme")
+        other = self.q.enqueue(title="Cannot notify either", company="Acme")
+        self.q.notifier = notifier
+
+        with self.assertLogs("hitl_queue.notify", level="WARNING"):
+            skipped = self.q.actions.skip(ticket["id"])
+            approved = self.q.actions.approve(other["id"], "CODEX")
+
+        expected = {"ok": False, "channel": "test", "error": "offline"}
+        self.assertEqual(skipped["notification"], expected)
+        self.assertEqual(approved["notification"], expected)
 
     def test_history_and_status_counts(self):
         first = self.q.enqueue(title="First")
@@ -80,8 +102,6 @@ class QueueTests(unittest.TestCase):
             except Exception as exc:  # pragma: no cover - asserted below
                 with lock:
                     errors.append(exc)
-            finally:
-                self.q.close()
 
         threads = [threading.Thread(target=enqueue, args=(i,)) for i in range(8)]
         for thread in threads:
@@ -92,6 +112,28 @@ class QueueTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(len(ids), 8)
         self.assertEqual(len(set(ids)), 8)
+
+    def test_close_closes_connections_created_by_all_threads(self):
+        connections = []
+        lock = threading.Lock()
+
+        def connect():
+            connection = self.q.db
+            connection.execute("SELECT 1").fetchone()
+            with lock:
+                connections.append(connection)
+
+        threads = [threading.Thread(target=connect) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(len(connections), 3)
+        self.q.close()
+        for connection in connections:
+            with self.assertRaisesRegex(Exception, "closed database"):
+                connection.execute("SELECT 1")
 
     def test_progress_text(self):
         text = progress_text(
