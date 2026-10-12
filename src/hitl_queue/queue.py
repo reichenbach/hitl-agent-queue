@@ -134,6 +134,18 @@ class Queue:
         if hasattr(self._connections, "db"):
             del self._connections.db
 
+    def close_thread(self) -> None:
+        """Close only the calling thread's connection; other threads keep theirs."""
+        connection = getattr(self._connections, "db", None)
+        if connection is None:
+            return
+        del self._connections.db
+        with self._connections_lock:
+            owned = connection in self._all_connections
+            self._all_connections.discard(connection)
+        if owned:
+            connection.close()
+
     def _notify(self, text: str, *, source: str) -> dict:
         return dispatch(
             self.notifier,

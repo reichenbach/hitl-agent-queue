@@ -11,7 +11,9 @@ outbox shown in the UI and are never sent anywhere.
 
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import os
 import secrets
 import tempfile
@@ -30,7 +32,10 @@ SIDE_LANE_STATUSES = ["blocked", "skipped", "cancelled"]
 APPROVABLE = {"new", "drafting", "review", "approved"}
 API_METHODS = ("board", "ticket", "approve", "skip", "set_mute")
 PREVIEW_BYTES = 4000
+MAX_BODY_BYTES = 1024 * 1024
 PAGE = Path(__file__).with_name("app.html")
+
+log = logging.getLogger(__name__)
 
 
 class OutboxNotifier:
@@ -275,7 +280,32 @@ class AppApi:
         return self.notifier()
 
     def _release_thread(self) -> None:
-        self._queue.close()
+        self._queue.close_thread()
+
+
+def _releasing(method):
+    @functools.wraps(method)
+    def call(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._release_thread()
+
+    return call
+
+
+class WebviewApi(AppApi):
+    """``AppApi`` for pywebview, which runs every js_api call on a fresh thread.
+
+    Each public method releases the calling thread's DB connection on return so
+    those short-lived threads do not leak connections.
+    """
+
+
+for _name, _method in vars(AppApi).items():
+    if not _name.startswith("_") and callable(_method):
+        setattr(WebviewApi, _name, _releasing(_method))
+del _name, _method
 
 
 def render_page(transport: str, token: str = "") -> str:
@@ -294,6 +324,8 @@ def make_http_handler(api: AppApi, token: str, page: str):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
             self.end_headers()
             self.wfile.write(data)
 
@@ -322,7 +354,15 @@ def make_http_handler(api: AppApi, token: str, page: str):
             got = (self.headers.get("X-Hitl-Token") or "").encode("utf-8")
             if not secrets.compare_digest(got, token.encode("utf-8")):
                 return self._error(401, "unauthorized")
-            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            try:
+                length = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                return self._error(400, "Content-Length required")
+            if length < 0:
+                return self._error(400, "invalid Content-Length")
+            if length > MAX_BODY_BYTES:
+                return self._error(413, "request body too large")
+            raw = self.rfile.read(length)
             try:
                 args = json.loads(raw.decode("utf-8") or "{}").get("args") or []
             except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
@@ -331,11 +371,15 @@ def make_http_handler(api: AppApi, token: str, page: str):
                 return self._error(400, "args must be a list")
             try:
                 result = getattr(api, name)(*args)
-            except TypeError as exc:
+                body = json.dumps(result, default=str)
+            except (TypeError, ValueError) as exc:
                 return self._error(400, str(exc))
+            except Exception:
+                log.exception("API call %s failed", name)
+                return self._error(500, "internal error")
             finally:
                 api._release_thread()
-            self._send(200, json.dumps(result, default=str))
+            self._send(200, body)
 
     return Handler
 
@@ -358,8 +402,8 @@ def _load_webview():
     return webview
 
 
-def _run_webview(webview, api: AppApi) -> None:
-    webview.create_window(
+def _run_webview(webview, api: AppApi, opened: threading.Event) -> None:
+    window = webview.create_window(
         "HITL queue - demo board",
         html=render_page("pywebview"),
         js_api=api,
@@ -367,6 +411,7 @@ def _run_webview(webview, api: AppApi) -> None:
         height=900,
         min_size=(1000, 640),
     )
+    window.events.shown += opened.set
     webview.start()
 
 
@@ -397,14 +442,18 @@ def launch(
         queue = OutboxQueue(Path(tmp), config=config)
         try:
             seed_demo(queue)
-            api = AppApi(queue)
             webview = None if force_browser else _load_webview()
             if webview is not None:
+                opened = threading.Event()
                 try:
-                    _run_webview(webview, api)
+                    _run_webview(webview, WebviewApi(queue), opened)
                     return 0
                 except Exception as exc:
+                    if opened.is_set():
+                        log.exception("pywebview failed after the window opened")
+                        return 1
+                    log.exception("pywebview could not start")
                     print(f"pywebview could not start ({exc}); opening in your browser instead.")
-            return _run_browser(api, port=port, open_browser=open_browser)
+            return _run_browser(AppApi(queue), port=port, open_browser=open_browser)
         finally:
             queue.close()

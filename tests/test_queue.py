@@ -135,6 +135,30 @@ class QueueTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "closed database"):
                 connection.execute("SELECT 1")
 
+    def test_close_thread_closes_only_the_calling_threads_connection(self):
+        main_connection = self.q.db
+        worker = {}
+
+        def connect_and_release():
+            worker["connection"] = self.q.db
+            self.q.close_thread()
+            self.q.close_thread()
+
+        thread = threading.Thread(target=connect_and_release)
+        thread.start()
+        thread.join(timeout=5)
+
+        with self.assertRaisesRegex(Exception, "closed database"):
+            worker["connection"].execute("SELECT 1")
+        main_connection.execute("SELECT 1").fetchone()
+        self.assertEqual(self.q._all_connections, {main_connection})
+
+        self.q.close_thread()
+        with self.assertRaisesRegex(Exception, "closed database"):
+            main_connection.execute("SELECT 1")
+        self.assertIsNot(self.q.db, main_connection)
+        self.q.db.execute("SELECT 1").fetchone()
+
     def test_progress_text(self):
         text = progress_text(
             {

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import http.client
+import inspect
 import io
 import json
 import os
@@ -12,7 +14,7 @@ import types
 import unittest
 import urllib.error
 import urllib.request
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -23,6 +25,7 @@ from hitl_queue.app import (
     AppApi,
     OutboxNotifier,
     OutboxQueue,
+    WebviewApi,
     demo_config,
     make_server,
     seed_demo,
@@ -140,6 +143,34 @@ class AppApiTests(_DemoCase):
                 queue.close()
 
 
+class WebviewApiTests(_DemoCase):
+    def test_each_call_releases_the_calling_threads_connection(self):
+        api = WebviewApi(self.queue)
+        main_connection = self.queue.db
+        results = []
+
+        def call():
+            results.append(api.board())
+            results.append(api.ticket(self.first("review")))
+
+        thread = threading.Thread(target=call)
+        thread.start()
+        thread.join(timeout=5)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(results[1]["ok"])
+        self.assertEqual(self.queue._all_connections, {main_connection})
+        main_connection.execute("SELECT 1").fetchone()
+
+    def test_exposes_same_public_methods_and_signatures(self):
+        api = WebviewApi(self.queue)
+        self.assertIsInstance(api, AppApi)
+        self.assertEqual(
+            list(inspect.signature(api.approve).parameters), ["ticket_id", "worker"]
+        )
+        self.assertNotIn("_release_thread", vars(WebviewApi))
+
+
 class OpenGateTests(_DemoCase):
     apply_opens = "2000-01-01"
 
@@ -211,13 +242,86 @@ class HttpFallbackTests(_DemoCase):
         self.assertEqual(self._post("ticket", token=self.token, body=b"not json")[0], 400)
         self.assertEqual(self._post("approve", ["TKT-0001"], token=self.token)[0], 400)
 
+    def test_request_keeps_other_threads_connections_open(self):
+        main_connection = self.queue.db
+        self.assertEqual(self._post("board", token=self.token)[0], 200)
+        main_connection.execute("SELECT 1").fetchone()
+        self.assertEqual(self.queue._all_connections, {main_connection})
+
+    def test_value_error_is_400_and_unexpected_error_is_500(self):
+        with mock.patch.object(self.api, "board", side_effect=ValueError("bad input")):
+            self.assertEqual(
+                self._post("board", token=self.token), (400, {"ok": False, "error": "bad input"})
+            )
+        with mock.patch.object(self.api, "board", side_effect=RuntimeError("boom")), self.assertLogs(
+            "hitl_queue.app", "ERROR"
+        ) as logs:
+            self.assertEqual(
+                self._post("board", token=self.token),
+                (500, {"ok": False, "error": "internal error"}),
+            )
+        self.assertIn("boom", "\n".join(logs.output))
+
+    def test_responses_forbid_framing(self):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=5) as resp:
+            headers = resp.headers
+        self.assertEqual(headers["X-Frame-Options"], "DENY")
+        self.assertEqual(headers["Content-Security-Policy"], "frame-ancestors 'none'")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(f"http://127.0.0.1:{self.port}/missing", timeout=5)
+        self.assertEqual(ctx.exception.headers["X-Frame-Options"], "DENY")
+
+    def _raw_post(self, content_length: str | None, body: bytes = b"") -> int:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.putrequest("POST", "/api/board", skip_accept_encoding=True)
+            conn.putheader("X-Hitl-Token", self.token)
+            if content_length is not None:
+                conn.putheader("Content-Length", content_length)
+            conn.endheaders(body or None)
+            resp = conn.getresponse()
+            resp.read()
+            return resp.status
+        finally:
+            conn.close()
+
+    def test_rejects_bad_content_length(self):
+        body = b'{"args": []}'
+        self.assertEqual(self._raw_post(str(len(body)), body), 200)
+        self.assertEqual(self._raw_post(None), 400)
+        self.assertEqual(self._raw_post("abc"), 400)
+        self.assertEqual(self._raw_post("-1"), 400)
+        self.assertEqual(self._raw_post(str(app.MAX_BODY_BYTES + 1)), 413)
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def fire(self):
+        for handler in self.handlers:
+            handler()
+
+
+def _fake_webview(start=None):
+    window = types.SimpleNamespace(events=types.SimpleNamespace(shown=_FakeEvent()))
+    return types.SimpleNamespace(
+        window=window,
+        create_window=mock.Mock(return_value=window),
+        start=mock.Mock(side_effect=start),
+    )
+
 
 class LauncherTests(unittest.TestCase):
-    def _launch(self, webview_module, **kwargs):
+    def _launch(self, webview_module, expect=0, **kwargs):
         with mock.patch.dict(sys.modules, {"webview": webview_module}), mock.patch.object(
             app, "_run_browser", return_value=0
-        ) as run_browser, redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(app.launch(**kwargs), 0)
+        ) as run_browser, redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            self.assertEqual(app.launch(**kwargs), expect)
         return run_browser, out.getvalue()
 
     def test_falls_back_to_browser_without_pywebview(self):
@@ -227,24 +331,39 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("pywebview is not installed", out)
 
     def test_uses_pywebview_when_installed(self):
-        fake = types.SimpleNamespace(create_window=mock.Mock(), start=mock.Mock())
+        fake = _fake_webview()
         run_browser, _ = self._launch(fake)
         run_browser.assert_not_called()
         kwargs = fake.create_window.call_args.kwargs
-        self.assertIsInstance(kwargs["js_api"], AppApi)
+        self.assertIsInstance(kwargs["js_api"], WebviewApi)
         self.assertIn('"transport": "pywebview"', kwargs["html"])
         fake.start.assert_called_once()
 
     def test_pywebview_start_failure_falls_back(self):
-        fake = types.SimpleNamespace(
-            create_window=mock.Mock(), start=mock.Mock(side_effect=RuntimeError("no GUI"))
-        )
-        run_browser, out = self._launch(fake)
+        fake = _fake_webview(start=RuntimeError("no GUI"))
+        with self.assertLogs("hitl_queue.app", "ERROR") as logs:
+            run_browser, out = self._launch(fake)
         run_browser.assert_called_once()
+        self.assertNotIsInstance(run_browser.call_args.args[0], WebviewApi)
         self.assertIn("no GUI", out)
+        self.assertIn("Traceback", "\n".join(logs.output))
+
+    def test_pywebview_failure_after_window_opens_does_not_fall_back(self):
+        fake = _fake_webview()
+
+        def crash_after_shown():
+            fake.window.events.shown.fire()
+            raise RuntimeError("renderer crashed")
+
+        fake.start.side_effect = crash_after_shown
+        with self.assertLogs("hitl_queue.app", "ERROR") as logs:
+            run_browser, out = self._launch(fake, expect=1)
+        run_browser.assert_not_called()
+        self.assertNotIn("opening in your browser", out)
+        self.assertIn("renderer crashed", "\n".join(logs.output))
 
     def test_force_browser_skips_pywebview(self):
-        fake = types.SimpleNamespace(create_window=mock.Mock(), start=mock.Mock())
+        fake = _fake_webview()
         run_browser, _ = self._launch(fake, force_browser=True)
         fake.create_window.assert_not_called()
         run_browser.assert_called_once()
