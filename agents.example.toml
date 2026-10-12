@@ -1,0 +1,31 @@
+# Relative allowed_folders are resolved from this file's directory.
+
+[agents.claude]
+type = "cli"
+command = ["claude", "-p"]
+allowed_folders = ["."]
+max_turns = 12
+timeout_seconds = 900
+
+[agents.codex]
+type = "cli"
+command = ["codex", "exec"]
+allowed_folders = ["."]
+max_turns = 12
+timeout_seconds = 900
+
+[agents.generic]
+type = "cli"
+command = ["agent", "--trust"]
+allowed_folders = ["."]
+max_turns = 12
+timeout_seconds = 900
+
+[agents.local]
+type = "openai_compat"
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder"
+# api_key_env = "LOCAL_LLM_API_KEY"
+allowed_folders = ["."]
+max_turns = 1
+timeout_seconds = 120
