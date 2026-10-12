@@ -33,7 +33,7 @@ jobs:
       - name: Package Windows app
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path "dist/HITL Tray.exe" -DestinationPath hitl-tray-Windows.zip
+        run: Compress-Archive -Path "dist/HITL Tray" -DestinationPath hitl-tray-Windows.zip
       - name: Package Linux app
         if: runner.os == 'Linux'
         run: tar -czf hitl-tray-Linux.tar.gz -C dist "HITL Tray"

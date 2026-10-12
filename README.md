@@ -191,7 +191,7 @@ python3 -m hitl_queue tray --demo          # neutral throwaway demo data only
   enabled, so the bundle appears only in the menu bar.
 - **Windows:** install the tray extra and run the command above, or build with
   `pyinstaller --noconfirm --clean packaging/hitl_tray.spec`; launch
-  `dist/HITL Tray.exe`.
+  `dist/HITL Tray/HITL Tray.exe`.
 - **Linux:** install a system tray implementation and GI bindings first. On
   Debian/Ubuntu: `sudo apt install libappindicator3-dev
   gir1.2-appindicator3-0.1 python3-gi`. Some desktop environments also require
