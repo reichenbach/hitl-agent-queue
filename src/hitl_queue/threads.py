@@ -256,26 +256,42 @@ class Threads:
                 run_started.append(True)
             cancel_event = threading.Event()
             self._running[run_id] = (agent, cancel_event)
-        prompt = self._prompt(thread_id, task)
-        try:
-            result = agent.run(prompt, agent.work_dir, cancel_event=cancel_event)
-        except BaseException as exc:
-            from .agents import AgentResult
-            result = AgentResult("", False, str(exc), time.time() - started, None)
-        with self._lock:
-            self._running.pop(run_id, None)
-            killed = self._run_status(run_id) == "killing"
-            status = "killed" if killed else ("ok" if result.ok else "error")
-            def finish():
+
+        result = None
+        killed = False
+
+        def finish(status: str, ok: bool, error: str | None, duration: float):
+            def update():
                 self.queue.db.execute(
                     "UPDATE agent_runs SET status=?,ended=?,ok=?,error=?,duration=? WHERE id=?",
-                    (status, time.time(), int(result.ok and not killed), result.error, result.duration, run_id),
+                    (status, time.time(), int(ok), error, duration, run_id),
                 )
                 self.queue.audit(
                     "agent_run_end", actor=agent.name, thread_id=thread_id, run_id=run_id,
-                    detail={"status": status, "ok": bool(result.ok and not killed), "error": result.error, "duration": result.duration},
+                    detail={"status": status, "ok": ok, "error": error, "duration": duration},
                 )
-            self.queue.transaction(finish)
+            self.queue.transaction(update)
+
+        try:
+            prompt = self._prompt(thread_id, task)
+            try:
+                result = agent.run(prompt, agent.work_dir, cancel_event=cancel_event)
+            except BaseException as exc:
+                from .agents import AgentResult
+                result = AgentResult("", False, str(exc), time.time() - started, None)
+            with self._lock:
+                killed = self._run_status(run_id) == "killing"
+                status = "killed" if killed else ("ok" if result.ok else "error")
+                finish(
+                    status, bool(result.ok and not killed), result.error, result.duration
+                )
+        except BaseException as exc:
+            duration = result.duration if result is not None else time.time() - started
+            finish("error", False, str(exc), duration)
+            raise
+        finally:
+            with self._lock:
+                self._running.pop(run_id, None)
         if killed:
             return []
         reply = self._append_message(thread_id, "agent", agent.name, result.output or result.error or "")

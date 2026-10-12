@@ -256,6 +256,52 @@ class ThreadTests(unittest.TestCase):
         run = self.queue.db.execute("SELECT * FROM agent_runs").fetchone()
         self.assertEqual(run["status"], "killed")
 
+    def test_prompt_failure_finalizes_run_and_clears_running_entry(self):
+        thread = self.queue.threads.create("Prompt failure")
+
+        with mock.patch.object(
+            self.queue.threads, "_prompt", side_effect=RuntimeError("prompt failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "prompt failed"):
+                self.queue.threads.post(thread["id"], "user", "@Helper task: go")
+
+        run = self.queue.db.execute("SELECT * FROM agent_runs").fetchone()
+        self.assertEqual(run["status"], "error")
+        self.assertEqual(run["ok"], 0)
+        self.assertEqual(run["error"], "prompt failed")
+        self.assertIsNotNone(run["ended"])
+        self.assertEqual(self.queue.threads._running, {})
+        event = self.queue.threads.audit_log()[-1]
+        self.assertEqual(event["event"], "agent_run_end")
+        self.assertEqual(event["detail"]["status"], "error")
+
+    def test_finish_failure_finalizes_run_as_error_and_clears_running_entry(self):
+        thread = self.queue.threads.create("Finish failure")
+        real_audit = self.queue.audit
+        failed = False
+
+        def fail_first_successful_finish(event, **kwargs):
+            nonlocal failed
+            detail = kwargs.get("detail", {})
+            if event == "agent_run_end" and detail.get("status") == "ok" and not failed:
+                failed = True
+                raise RuntimeError("finish failed")
+            return real_audit(event, **kwargs)
+
+        with mock.patch.object(self.queue, "audit", side_effect=fail_first_successful_finish):
+            with self.assertRaisesRegex(RuntimeError, "finish failed"):
+                self.queue.threads.post(thread["id"], "user", "@Helper task: go")
+
+        run = self.queue.db.execute("SELECT * FROM agent_runs").fetchone()
+        self.assertEqual(run["status"], "error")
+        self.assertEqual(run["ok"], 0)
+        self.assertEqual(run["error"], "finish failed")
+        self.assertIsNotNone(run["ended"])
+        self.assertEqual(self.queue.threads._running, {})
+        event = self.queue.threads.audit_log()[-1]
+        self.assertEqual(event["event"], "agent_run_end")
+        self.assertEqual(event["detail"]["status"], "error")
+
     def test_audit_is_append_only_and_records_messages_runs_and_approval(self):
         thread = self.queue.threads.create("Audit")
         self.queue.threads.post(thread["id"], "user", "@Helper task: go")
