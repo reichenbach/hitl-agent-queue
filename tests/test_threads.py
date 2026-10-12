@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from hitl_queue import Queue
-from hitl_queue.agents import AgentLimits, FakeAgent
+from hitl_queue.agents import AgentLimits, FakeAgent, UsagePlan
 
 
 class ThreadTests(unittest.TestCase):
@@ -256,6 +256,30 @@ class ThreadTests(unittest.TestCase):
         run = self.queue.db.execute("SELECT * FROM agent_runs").fetchone()
         self.assertEqual(run["status"], "killed")
 
+    def test_kill_matches_config_key_not_display_name(self):
+        slow = FakeAgent(
+            "Display Name", self.agent.limits, output="too late", delay_seconds=5,
+            work_dir=self.work,
+        )
+        self.queue.threads.configure({"worker-key": slow})
+        thread = self.queue.threads.create("Kill by key")
+        result = {}
+        worker = threading.Thread(target=lambda: result.update(
+            self.queue.threads.post(thread["id"], "user", "@worker-key task: wait")
+        ))
+        worker.start()
+        deadline = time.monotonic() + 1
+        while not slow.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.queue.threads.kill("worker-key")
+        worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result["replies"], [])
+        run = self.queue.db.execute("SELECT * FROM agent_runs").fetchone()
+        self.assertEqual(run["status"], "killed")
+
     def test_prompt_failure_finalizes_run_and_clears_running_entry(self):
         thread = self.queue.threads.create("Prompt failure")
 
@@ -353,6 +377,24 @@ class ThreadTests(unittest.TestCase):
         self.assertIn(
             "usage_record_error", [row["event"] for row in self.queue.threads.audit_log()]
         )
+
+    def test_usage_notify_failure_is_not_a_usage_record_failure(self):
+        agent = FakeAgent(
+            "Display Name", self.agent.limits, output="done", work_dir=self.work,
+            usage_plan=UsagePlan("daily", runs=1),
+        )
+        self.queue.threads.configure({"worker-key": agent})
+        thread = self.queue.threads.create("Notify failure")
+
+        with mock.patch.object(self.queue, "_notify", side_effect=RuntimeError("notify down")):
+            result = self.queue.threads.post(
+                thread["id"], "user", "@worker-key task: go"
+            )
+
+        self.assertEqual(len(result["replies"]), 1)
+        events = [row["event"] for row in self.queue.threads.audit_log()]
+        self.assertIn("usage_notify_error", events)
+        self.assertNotIn("usage_record_error", events)
 
     def test_audit_is_append_only_and_records_messages_runs_and_approval(self):
         thread = self.queue.threads.create("Audit")

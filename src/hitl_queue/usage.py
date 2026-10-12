@@ -18,6 +18,10 @@ INPUT_FIELDS = ("input_tokens", "prompt_tokens")
 OUTPUT_FIELDS = ("output_tokens", "completion_tokens")
 
 
+class UsageNotifyError(RuntimeError):
+    """A usage alert was recorded, but its notification could not be sent."""
+
+
 def token_count(usage: Mapping | None) -> int | None:
     """Extract common OpenAI-compatible token fields without inventing a value."""
     if not isinstance(usage, Mapping):
@@ -200,10 +204,14 @@ class UsageMonitor:
             inserted = self.queue.transaction(insert_and_audit)
             if not inserted:
                 continue
-            self.queue._notify(
-                f"Usage {level}: {agent.name} reached {fraction * 100:.1f}% of its {plan.window} plan",
-                source="hitl-usage",
-            )
+            try:
+                self.queue._notify(
+                    f"Usage {level}: {agent.name} reached "
+                    f"{fraction * 100:.1f}% of its {plan.window} plan",
+                    source="hitl-usage",
+                )
+            except BaseException as exc:
+                raise UsageNotifyError(str(exc)) from exc
 
 
 def _window(spec: str, now: float) -> tuple[float, str]:

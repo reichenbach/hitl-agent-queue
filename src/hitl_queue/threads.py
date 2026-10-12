@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .agents import Agent
+from .usage import UsageNotifyError
 
 if TYPE_CHECKING:
     from .queue import Queue
@@ -31,7 +32,7 @@ class Threads:
     def __init__(self, queue: Queue):
         self.queue = queue
         self._agents: dict[str, Agent] = {}
-        self._running: dict[int, tuple[Agent, threading.Event]] = {}
+        self._running: dict[int, tuple[str, Agent, threading.Event]] = {}
         self._lock = threading.RLock()
         self.queue.db.executescript(
             """
@@ -261,7 +262,7 @@ class Threads:
             if run_started is not None:
                 run_started.append(True)
             cancel_event = threading.Event()
-            self._running[run_id] = (agent, cancel_event)
+            self._running[run_id] = (key, agent, cancel_event)
 
         result = None
         killed = False
@@ -335,6 +336,16 @@ class Threads:
         """Accounting must never change the observable outcome of an agent run."""
         try:
             self.queue.usage.record(key, **fields)
+        except UsageNotifyError as exc:
+            logger.exception("failed to notify usage for run %s", fields["run_id"])
+            try:
+                self.queue.transaction(lambda: self.queue.audit(
+                    "usage_notify_error", actor=agent.name, thread_id=thread_id,
+                    run_id=fields["run_id"], detail={"error": str(exc)},
+                ))
+            except BaseException:
+                logger.exception("failed to audit usage notification failure for run %s",
+                                 fields["run_id"])
         except BaseException as exc:
             logger.exception("failed to record usage for run %s", fields["run_id"])
             try:
@@ -404,8 +415,9 @@ class Threads:
         self._set_control(agent, "killed", "kill")
         key = agent.casefold() if agent else None
         with self._lock:
-            targets = [(run_id, runner, event) for run_id, (runner, event) in self._running.items()
-                       if key is None or runner.name.casefold() == key]
+            targets = [(run_id, runner, event)
+                       for run_id, (config_key, runner, event) in self._running.items()
+                       if key is None or config_key == key]
             for run_id, runner, event in targets:
                 self.queue.db.execute("UPDATE agent_runs SET status='killing' WHERE id=?", (run_id,))
                 runner.cancel(event)
