@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -41,6 +42,56 @@ class QueueTests(unittest.TestCase):
         t = self.q.enqueue(title="Nope", company="Mill")
         self.assertTrue(self.q.handle_reply(f"SKIP {t['id']}")["ok"])
         self.assertEqual(self.q.get(t["id"])["status"], "skipped")
+
+    def test_shared_actions_match_reply_behavior(self):
+        t = self.q.enqueue(title="Direct action", company="Acme")
+        out = self.q.actions.approve(t["id"], "CODEX")
+        self.assertEqual(out["action"], "prefer_worker")
+        self.assertEqual(self.q.get(t["id"])["payload"]["preferred_worker"], "codex")
+
+        other = self.q.enqueue(title="Direct skip", company="Acme")
+        out = self.q.actions.skip(other["id"])
+        self.assertEqual(out, {"ok": True, "action": "skip", "id": other["id"]})
+
+    def test_history_and_status_counts(self):
+        first = self.q.enqueue(title="First")
+        second = self.q.enqueue(title="Second")
+        self.q.claim(first["id"], "cursor-draft")
+        self.q.actions.skip(second["id"])
+
+        history = self.q.history(first["id"])
+        self.assertEqual([event["status"] for event in history], ["new", "drafting"])
+        self.assertEqual(self.q.status_history(first["id"]), history)
+        counts = self.q.count_by_status()
+        self.assertEqual(counts["drafting"], 1)
+        self.assertEqual(counts["skipped"], 1)
+        self.assertEqual(self.q.status_counts(), counts)
+
+    def test_one_queue_is_safe_across_threads(self):
+        errors = []
+        ids = []
+        lock = threading.Lock()
+
+        def enqueue(index):
+            try:
+                ticket = self.q.enqueue(title=f"Thread {index}")
+                with lock:
+                    ids.append(ticket["id"])
+            except Exception as exc:  # pragma: no cover - asserted below
+                with lock:
+                    errors.append(exc)
+            finally:
+                self.q.close()
+
+        threads = [threading.Thread(target=enqueue, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(errors)
+        self.assertEqual(len(ids), 8)
+        self.assertEqual(len(set(ids)), 8)
 
     def test_progress_text(self):
         text = progress_text(

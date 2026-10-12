@@ -28,6 +28,36 @@ class Notifier(Protocol):
     def notify(self, text: str, *, source: str = "hitl-queue") -> dict: ...
 
 
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def dispatch(
+    notifier: Notifier,
+    text: str,
+    *,
+    source: str = "hitl-queue",
+    mute: bool | None = None,
+) -> dict:
+    """Send one notification and report the selected channel and outcome."""
+    muted = _env_truthy("HITL_NOTIFY_MUTE") if mute is None else mute
+    if muted:
+        return {"channel": "muted", "ok": True, "error": None}
+
+    try:
+        result = dict(notifier.notify(text, source=source) or {})
+    except Exception as exc:
+        return {
+            "channel": notifier.__class__.__name__.removesuffix("Notifier").lower(),
+            "ok": False,
+            "error": str(exc),
+        }
+    result.setdefault("channel", notifier.__class__.__name__.removesuffix("Notifier").lower())
+    result["ok"] = bool(result.get("ok"))
+    result.setdefault("error", None)
+    return result
+
+
 def plain(s: str) -> str:
     return (
         (s or "")

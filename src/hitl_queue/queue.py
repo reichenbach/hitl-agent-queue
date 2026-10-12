@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-from .notify import get_notifier, progress_text
+from .notify import dispatch, get_notifier, progress_text
 
 STATUSES = {
     "new",
@@ -41,6 +42,7 @@ DEFAULT_CONFIG = {
     "apply_opens": "2099-01-01",
     "default_apply_worker": "codex",
     "notify_progress": True,
+    "mute_notifications": False,
     "progress_events": [
         "drafting",
         "approved",
@@ -71,8 +73,7 @@ class Queue:
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.cfg = config or dict(DEFAULT_CONFIG)
         self.notifier = notifier or get_notifier()
-        self.db = sqlite3.connect(self.state / "queue.sqlite3", timeout=30, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
+        self._connections = threading.local()
         self.db.executescript(
             """
             PRAGMA journal_mode=WAL;
@@ -100,8 +101,36 @@ class Queue:
             """
         )
 
+        # Imported lazily to keep the action layer independent of construction.
+        from .actions import Actions
+
+        self.actions = Actions(self)
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        """Return this thread's connection; Queue instances can be shared safely."""
+        connection = getattr(self._connections, "db", None)
+        if connection is None:
+            connection = sqlite3.connect(
+                self.state / "queue.sqlite3", timeout=30, isolation_level=None
+            )
+            connection.row_factory = sqlite3.Row
+            self._connections.db = connection
+        return connection
+
     def close(self) -> None:
-        self.db.close()
+        connection = getattr(self._connections, "db", None)
+        if connection is not None:
+            connection.close()
+            del self._connections.db
+
+    def _notify(self, text: str, *, source: str) -> dict:
+        return dispatch(
+            self.notifier,
+            text,
+            source=source,
+            mute=bool(self.cfg.get("mute_notifications", False)),
+        )
 
     def transaction(self, fn):
         self.db.execute("BEGIN IMMEDIATE")
@@ -147,12 +176,35 @@ class Queue:
         sql += " ORDER BY created"
         return [dict(r) for r in self.db.execute(sql, args)]
 
+    def history(self, tid: str) -> list[dict]:
+        """Return a ticket's status events in chronological order."""
+        self.get(tid)  # Give callers the same unknown-ticket error as other helpers.
+        rows = self.db.execute(
+            "SELECT seq,ticket_id,status,actor,note,at FROM events "
+            "WHERE ticket_id=? ORDER BY seq",
+            (tid,),
+        )
+        return [dict(row) for row in rows]
+
+    status_history = history
+
+    def count_by_status(self) -> dict[str, int]:
+        """Count all tickets, including terminal tickets, grouped by status."""
+        counts = {status: 0 for status in STATUSES}
+        for row in self.db.execute(
+            "SELECT status, COUNT(*) AS count FROM tickets GROUP BY status"
+        ):
+            counts[row["status"]] = row["count"]
+        return counts
+
+    status_counts = count_by_status
+
     def _ping(self, ticket: dict, status: str, detail: str = "") -> None:
         if not self.cfg.get("notify_progress", True):
             return
         if status not in (self.cfg.get("progress_events") or []):
             return
-        self.notifier.notify(
+        self._notify(
             progress_text(ticket, status, detail=detail),
             source="hitl-progress",
         )
@@ -196,7 +248,7 @@ class Queue:
             return self.get(tid)
 
         ticket = self.transaction(action)
-        self.notifier.notify(
+        self._notify(
             f"New {ticket['id']}\n{ticket.get('company') or ''} - {ticket['title']}\n"
             f"Queued for draft.\nSkip: SKIP {ticket['id']}",
             source="hitl-new",
@@ -281,7 +333,7 @@ class Queue:
             )
 
         ticket = self.transaction(action)
-        self.notifier.notify(
+        self._notify(
             f"{tid} ready\n{ticket.get('company') or ''} - {ticket['title']}\n"
             f"Reply:\nAPPROVE {tid} CODEX\nAPPROVE {tid} CLAUDE\nSKIP {tid}",
             source="hitl-review",
@@ -395,32 +447,11 @@ class Queue:
         )
         if m:
             tid, worker = m.group(2).upper(), m.group(3).lower()
-            ticket = self.get(tid)
-            if ticket["status"] in {"new", "drafting"}:
-                self.set_preferred_worker(tid, worker)
-                self.notifier.notify(
-                    f"Got it. {tid} → {worker} after draft. Reply SKIP {tid} to cancel.",
-                    source="hitl-reply",
-                )
-                return {"ok": True, "action": "prefer_worker", "id": tid, "worker": worker}
-            if ticket["status"] == "review":
-                self.approve(tid, actor="human", note=f"APPROVE → {worker}")
-            elif ticket["status"] != "approved":
-                self.notifier.notify(
-                    f"{tid} is {ticket['status']}; cannot approve.",
-                    source="hitl-reply",
-                )
-                return {"ok": False, "error": f"status {ticket['status']}"}
-            mode = "apply" if apply_gate_open(self.cfg) else "review_only"
-            self.handoff(tid, to=worker, actor="human", mode=mode)
-            self.notifier.notify(f"OK {tid} → {worker} ({mode})", source="hitl-reply")
-            return {"ok": True, "action": "handoff", "id": tid, "worker": worker, "mode": mode}
+            return self.actions.approve(tid, worker)
 
         m = re.match(r"^\s*(SKIP|DENY|NO)\s+(TKT-\d+)\s*$", line, re.I)
         if m:
             tid = m.group(2).upper()
-            self.skip(tid, actor="human", note="SKIP via reply")
-            self.notifier.notify(f"Skipped {tid}", source="hitl-reply")
-            return {"ok": True, "action": "skip", "id": tid}
+            return self.actions.skip(tid)
 
         return {"ok": False, "error": "unparsed"}

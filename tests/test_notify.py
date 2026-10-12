@@ -18,6 +18,7 @@ from hitl_queue.notify import (
     StdoutNotifier,
     TeamsNotifier,
     build_notifier,
+    dispatch,
     get_notifier,
 )
 from hitl_queue.queue import Queue
@@ -123,6 +124,20 @@ class NotifyTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(SlackNotifier().notify("x")["ok"])
             self.assertFalse(TeamsNotifier().notify("x")["ok"])
+
+    def test_dispatch_can_be_muted_and_reports_outcome(self):
+        class Unexpected:
+            def notify(self, text, *, source="hitl-queue"):
+                raise AssertionError("muted dispatch must not notify")
+
+        self.assertEqual(
+            dispatch(Unexpected(), "quiet", mute=True),
+            {"channel": "muted", "ok": True, "error": None},
+        )
+        out = dispatch(SlackNotifier(webhook_url=""), "fails", mute=False)
+        self.assertEqual(out["channel"], "slack")
+        self.assertFalse(out["ok"])
+        self.assertIn("error", out)
 
 
 class ReplyServerTests(unittest.TestCase):
