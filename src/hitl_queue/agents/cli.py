@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Sequence
@@ -33,7 +33,7 @@ class CliAgent(Agent):
             raise ValueError("extra_args must be a list of non-empty strings")
         if turns_flag is not None and not turns_flag:
             raise ValueError("turns_flag must be a non-empty string")
-        if prompt_via not in {"stdin", "arg"}:
+        if not isinstance(prompt_via, str) or prompt_via not in {"stdin", "arg"}:
             raise ValueError("prompt_via must be 'stdin' or 'arg'")
         if not all(isinstance(name, str) and name for name in env_passthrough):
             raise ValueError("env_passthrough must be a list of non-empty strings")
@@ -53,39 +53,66 @@ class CliAgent(Agent):
         allowed_env = {"PATH", "HOME", "LANG", "TERM", "USER", "TMPDIR"}
         allowed_env.update(self.env_passthrough)
         env = {key: value for key, value in os.environ.items() if key in allowed_env}
+        process = None
+        workers: tuple[threading.Thread, ...] = ()
         try:
-            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-                process = subprocess.Popen(
-                    argv,
-                    cwd=cwd,
-                    stdin=subprocess.PIPE if self.prompt_via == "stdin" else subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    env=env,
-                    start_new_session=True,
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                stdin=subprocess.PIPE if self.prompt_via == "stdin" else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                start_new_session=True,
+            )
+            assert process.stdout is not None and process.stderr is not None
+            stdout_capture = _BoundedCapture(self.limits.max_output_bytes)
+            stderr_capture = _BoundedCapture(self.limits.max_output_bytes)
+            readers = (
+                threading.Thread(target=stdout_capture.drain, args=(process.stdout,)),
+                threading.Thread(target=stderr_capture.drain, args=(process.stderr,)),
+            )
+            workers = readers
+            if process.stdin is not None:
+                workers += (
+                    threading.Thread(
+                        target=_write_input, args=(process.stdin, input_bytes or b"")
+                    ),
                 )
-                try:
-                    process.communicate(input=input_bytes, timeout=self.limits.timeout_seconds)
-                except subprocess.TimeoutExpired:
-                    _terminate_process_group(process)
-                    output, truncated = _read_limited(stdout, self.limits.max_output_bytes)
-                    return AgentResult(
-                        output, False,
-                        f"timed out after {self.limits.timeout_seconds:g} seconds",
-                        time.monotonic() - started, None, truncated,
-                    )
-                output, truncated = _read_limited(stdout, self.limits.max_output_bytes)
-                error_output, _ = _read_limited(stderr, self.limits.max_output_bytes)
-                return AgentResult(
-                    output=output,
-                    ok=process.returncode == 0,
-                    error=None if process.returncode == 0 else error_output.strip() or f"exit code {process.returncode}",
-                    duration=time.monotonic() - started,
-                    turns=None,
-                    truncated=truncated,
-                )
+            for worker in workers:
+                worker.start()
+            timed_out = False
+            try:
+                process.wait(timeout=self.limits.timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
         except OSError as exc:
             return AgentResult("", False, str(exc), time.monotonic() - started, None)
+        finally:
+            if process is not None:
+                _terminate_process_group(process)
+            for worker in workers:
+                worker.join()
+        output, truncated = stdout_capture.result()
+        if timed_out:
+            return AgentResult(
+                output, False,
+                f"timed out after {self.limits.timeout_seconds:g} seconds",
+                time.monotonic() - started, None, truncated,
+            )
+        error_output, _ = stderr_capture.result()
+        return AgentResult(
+            output=output,
+            ok=process.returncode == 0,
+            error=(
+                None
+                if process.returncode == 0
+                else error_output.strip() or f"exit code {process.returncode}"
+            ),
+            duration=time.monotonic() - started,
+            turns=None,
+            truncated=truncated,
+        )
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -104,7 +131,28 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     process.wait()
 
 
-def _read_limited(handle, limit: int) -> tuple[str, bool]:
-    handle.seek(0)
-    data = handle.read(limit + 1)
-    return data[:limit].decode("utf-8", errors="ignore"), len(data) > limit
+class _BoundedCapture:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.data = bytearray()
+        self.truncated = False
+
+    def drain(self, handle) -> None:
+        with handle:
+            while chunk := handle.read(65536):
+                remaining = self.limit - len(self.data)
+                if remaining:
+                    self.data.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    self.truncated = True
+
+    def result(self) -> tuple[str, bool]:
+        return self.data.decode("utf-8", errors="ignore"), self.truncated
+
+
+def _write_input(handle, data: bytes) -> None:
+    with handle:
+        try:
+            handle.write(data)
+        except BrokenPipeError:
+            pass

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -173,6 +174,28 @@ timeout_seconds = 10
         self.assertEqual(result.output, "abcde")
         self.assertTrue(result.truncated)
 
+    def test_cli_rejects_non_string_prompt_via(self):
+        for value in (None, ["stdin"], {"stdin": True}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                CliAgent("bad", [sys.executable], self.limits, prompt_via=value)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
+    def test_cli_normal_exit_kills_grandchild(self):
+        pid_file = self.root / "normal-grandchild.pid"
+        child = "import time; time.sleep(30)"
+        parent = (
+            "import pathlib,subprocess,sys; "
+            f"p=subprocess.Popen([sys.executable,'-c',{child!r}]); "
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(p.pid))"
+        )
+        result = CliAgent("tree", [sys.executable, "-c", parent], self.limits).run(
+            "x", self.root
+        )
+        self.assertTrue(result.ok, result.error)
+        pid = int(pid_file.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
     @mock.patch("urllib.request.build_opener")
     def test_http_adapter_posts_chat_completion(self, build_opener):
         opener = _Opener(_Response(
@@ -193,6 +216,10 @@ timeout_seconds = 10
             json.loads(request.data),
             {"model": "test-model", "messages": [{"role": "user", "content": "say hi"}]},
         )
+        proxy_handler, redirect_handler = build_opener.call_args.args
+        self.assertIsInstance(proxy_handler, urllib.request.ProxyHandler)
+        self.assertEqual(proxy_handler.proxies, {})
+        self.assertEqual(redirect_handler.__class__.__name__, "_NoRedirect")
 
     @mock.patch("urllib.request.build_opener")
     def test_http_adapter_requires_configured_key(self, build_opener):
@@ -214,6 +241,7 @@ timeout_seconds = 10
             "http://localhost:1",
             "http://127.0.0.1",
             "http://10.0.0.2",
+            "http://169.254.169.254",
             "http://box.local",
         ):
             OpenAICompatAgent("local", url, "model", self.limits)
@@ -227,8 +255,8 @@ timeout_seconds = 10
         result = OpenAICompatAgent(
             "local", "http://localhost:1", "model", limits
         ).run("x", self.root)
-        self.assertEqual(result.output, "abcde")
-        self.assertTrue(result.ok)
+        self.assertEqual(result.output, "")
+        self.assertFalse(result.ok)
         self.assertTrue(result.truncated)
 
     def test_redirect_handler_disables_redirects(self):

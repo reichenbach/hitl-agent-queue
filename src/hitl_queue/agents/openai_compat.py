@@ -52,9 +52,16 @@ class OpenAICompatAgent(Agent):
             f"{self.base_url}/v1/chat/completions", data=body, headers=headers, method="POST"
         )
         try:
-            opener = urllib.request.build_opener(_NoRedirect)
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), _NoRedirect()
+            )
             with opener.open(request, timeout=self.limits.timeout_seconds) as response:
-                raw = response.read()
+                raw = response.read(self.limits.max_output_bytes + 1)
+            if len(raw) > self.limits.max_output_bytes:
+                return AgentResult(
+                    "", False, "response body exceeded max_output_bytes",
+                    time.monotonic() - started, None, True,
+                )
             payload = json.loads(raw.decode("utf-8"))
             output = payload["choices"][0]["message"]["content"]
             if not isinstance(output, str):

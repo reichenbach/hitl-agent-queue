@@ -33,6 +33,10 @@ timeout_seconds = 900
 
 [agents.local]
 type = "openai_compat"
+# Plain HTTP is allowed for the LAN exception: localhost, private/loopback and
+# link-local IPs (including the metadata address 169.254.169.254), and any host
+# whose name ends in .local. A .local name is trusted by name without DNS/IP
+# resolution, so configure it only when that naming convention is trusted.
 base_url = "http://127.0.0.1:11434"
 model = "qwen2.5-coder"
 # api_key_env = "LOCAL_LLM_API_KEY"
