@@ -43,6 +43,7 @@ DEFAULT_CONFIG = {
     "default_apply_worker": "codex",
     "notify_progress": True,
     "mute_notifications": False,
+    "max_review_rounds": 3,
     "progress_events": [
         "drafting",
         "approved",

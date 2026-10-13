@@ -129,6 +129,23 @@ timeout_seconds = 10
         self.assertEqual(agents["worker"].limits.max_output_bytes, 1234)
         self.assertEqual(agents["server"].base_url, "http://localhost:1234")
 
+    def test_threads_config_loads_review_round_cap(self):
+        from hitl_queue import Queue
+
+        (self.root / "work").mkdir()
+        config = self.root / "agents.toml"
+        config.write_text(
+            "[threads]\nmax_review_rounds = 5\n"
+            "[agents.worker]\ntype='fake'\nallowed_folders=['work']\n"
+            "work_dir='work'\nmax_turns=1\ntimeout_seconds=1\n"
+        )
+        queue = Queue(self.root / "state")
+        try:
+            queue.threads.configure_from(config)
+            self.assertEqual(queue.cfg["max_review_rounds"], 5)
+        finally:
+            queue.close()
+
     def test_folder_enforcement(self):
         outside = self.root.parent / "not-allowed"
         result = FakeAgent("fake", self.limits).run("hello", outside)

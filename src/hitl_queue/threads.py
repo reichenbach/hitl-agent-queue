@@ -22,6 +22,7 @@ MENTION_RE = re.compile(
     r"(?im)(?:^|\s)@(?P<agent>[A-Za-z][\w.-]*)\s+(?P<kind>task|fyi)\s*:\s*(?P<body>[^\n]*)"
 )
 ACTION_RE = re.compile(r"(?i)(?<![\w])ACTION_REQUEST\s*:\s*")
+REVIEW_VERDICT_RE = re.compile(r"(?im)^\s*(?:REVIEW_)?VERDICT\s*:\s*(.*)$")
 OUTBOUND_ACTIONS = {"push", "merge", "send", "network"}
 SUMMARY_LIMIT = 160
 logger = logging.getLogger(__name__)
@@ -69,6 +70,14 @@ class Threads:
               agent TEXT PRIMARY KEY,
               state TEXT NOT NULL CHECK(state IN ('active','paused','killed'))
             );
+            CREATE TABLE IF NOT EXISTS review_rounds(
+              thread_id TEXT NOT NULL REFERENCES threads(id),
+              scope TEXT NOT NULL,
+              change_count INTEGER NOT NULL DEFAULT 0,
+              blocked INTEGER NOT NULL DEFAULT 0,
+              approval_ticket_id TEXT,
+              PRIMARY KEY(thread_id, scope)
+            );
             CREATE TABLE IF NOT EXISTS audit_log(
               seq INTEGER PRIMARY KEY AUTOINCREMENT,
               event TEXT NOT NULL,
@@ -104,6 +113,7 @@ class Threads:
             self.queue.db.execute(
                 "ALTER TABLE threads ADD COLUMN allow_agent_to_agent INTEGER NOT NULL DEFAULT 0"
             )
+        self._set_max_review_rounds(self.queue.cfg.get("max_review_rounds", 3))
 
     def configure(self, agents: dict[str, Agent]) -> None:
         for agent in agents.values():
@@ -113,9 +123,22 @@ class Threads:
 
     def configure_from(self, path: str | Path = "agents.toml") -> None:
         """Load adapters using the public ``hitl_queue.agents`` configuration."""
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover
+            import tomli as tomllib
         from .agents import load_agents
 
+        with Path(path).expanduser().open("rb") as handle:
+            document = tomllib.load(handle)
+        value = (document.get("threads") or {}).get("max_review_rounds", 3)
+        self._set_max_review_rounds(value)
         self.configure(load_agents(path))
+
+    def _set_max_review_rounds(self, value: int) -> None:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("max_review_rounds must be a positive integer")
+        self.queue.cfg["max_review_rounds"] = value
 
     def create(
         self, title: str, *, max_agent_runs: int = 12, allow_agent_to_agent: bool = False
@@ -317,6 +340,7 @@ class Threads:
         reply = self._append_message(thread_id, "agent", agent.name, result.output or result.error or "")
         if result.ok:
             self._gate_action_requests(thread_id, agent.name, result.output)
+        review = self._record_review_verdict(thread_id, agent.name, result.output) if result.ok else None
         replies = [reply]
         if result.ok:
             for mention in MENTION_RE.finditer(result.output):
@@ -328,10 +352,154 @@ class Threads:
                             detail={"target": target, "kind": "task"},
                         )
                         continue
+                    if review and review["blocked"]:
+                        self._hold_review_handoff(
+                            thread_id, review, agent.name, target, mention.group("body")
+                        )
+                        continue
                     replies.extend(self._wake(
                         thread_id, target, mention.group("body"), "agent", agent.name,
                     ))
         return replies
+
+    def _record_review_verdict(self, thread_id: str, reviewer: str, output: str) -> dict | None:
+        """Persist a CHANGE verdict and return its durable scope state."""
+        match = REVIEW_VERDICT_RE.search(output)
+        if not match:
+            return None
+        raw = match.group(1).strip()
+        data: dict = {}
+        if raw.startswith("{"):
+            try:
+                parsed, _ = json.JSONDecoder().raw_decode(raw)
+                data = parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError:
+                self.queue.audit("review_verdict_parse_error", actor=reviewer,
+                                 thread_id=thread_id, detail={"error": "invalid JSON"})
+                return None
+        else:
+            data["verdict"] = raw.split()[0] if raw else ""
+        if str(data.get("verdict", "")).upper() != "CHANGE":
+            return None
+        ticket_id = str(data.get("ticket_id", "")).upper()
+        raw_branch = str(data.get("branch", "")).strip()
+        branch = self._sanitize_summary(raw_branch) if raw_branch else ""
+        scope = f"ticket:{ticket_id}" if re.fullmatch(r"TKT-\d+", ticket_id) else (
+            f"branch:{branch}" if branch else f"thread:{thread_id}"
+        )
+        summary = self._sanitize_summary(str(data.get("summary") or output))
+        findings = data.get("findings", [])
+        if not isinstance(findings, list):
+            findings = [str(findings)]
+        findings = [self._sanitize_summary(str(item)) for item in findings[:10] if str(item).strip()]
+        prior = next((m for m in reversed(self.messages(thread_id)[:-1])
+                      if m["author_type"] == "agent" and m["author"] != reviewer), None)
+        builder_summary = self._sanitize_summary(prior["body"]) if prior else "No builder summary available"
+        limit = int(self.queue.cfg.get("max_review_rounds", 3))
+
+        def record():
+            self.queue.db.execute(
+                "INSERT INTO review_rounds(thread_id,scope,change_count) VALUES(?,?,1) "
+                "ON CONFLICT(thread_id,scope) DO UPDATE SET change_count=change_count+1",
+                (thread_id, scope),
+            )
+            row = self.queue.db.execute(
+                "SELECT * FROM review_rounds WHERE thread_id=? AND scope=?", (thread_id, scope)
+            ).fetchone()
+            blocked = bool(row["blocked"] or row["change_count"] >= limit)
+            if blocked and not row["blocked"]:
+                self.queue.db.execute(
+                    "UPDATE review_rounds SET blocked=1 WHERE thread_id=? AND scope=?",
+                    (thread_id, scope),
+                )
+            self.queue.audit(
+                "review_change", actor=reviewer, thread_id=thread_id,
+                detail={"scope": scope, "round": row["change_count"], "limit": limit,
+                        "blocked": blocked, "summary": summary, "findings": findings},
+            )
+            return {"scope": scope, "round": row["change_count"], "limit": limit,
+                    "blocked": blocked, "reviewer_summary": summary,
+                    "builder_summary": builder_summary, "findings": findings,
+                    "newly_blocked": blocked and not bool(row["blocked"])}
+
+        review = self.queue.transaction(record)
+        if review["newly_blocked"]:
+            ticket = self._create_approval_ticket(
+                thread_id, reviewer, "review_round_cap",
+                f"Review round cap reached for {review['scope']}", review,
+            )
+            self.queue.transaction(lambda: self.queue.db.execute(
+                "UPDATE review_rounds SET approval_ticket_id=? WHERE thread_id=? AND scope=?",
+                (ticket["id"], thread_id, review["scope"]),
+            ))
+            self.queue.audit("review_round_cap", actor=reviewer, thread_id=thread_id,
+                             ticket_id=ticket["id"], detail=review)
+        return review
+
+    def _hold_review_handoff(
+        self, thread_id: str, review: dict, reviewer: str, target: str, task: str
+    ) -> None:
+        row = self.queue.db.execute(
+            "SELECT approval_ticket_id FROM review_rounds WHERE thread_id=? AND scope=?",
+            (thread_id, review["scope"]),
+        ).fetchone()
+        if row and row["approval_ticket_id"]:
+            ticket = self.queue.get(row["approval_ticket_id"])
+            payload = ticket["payload"]
+            payload["review_round_cap"].update({"target_agent": target, "task": task})
+            self.queue.db.execute(
+                "UPDATE tickets SET payload=?,updated=? WHERE id=?",
+                (json.dumps(payload, sort_keys=True), time.time(), ticket["id"]),
+            )
+            self.queue.audit("review_handoff_blocked", actor=reviewer, thread_id=thread_id,
+                             ticket_id=row["approval_ticket_id"],
+                             detail={"scope": review["scope"], "target": target})
+            return
+        request = {**review, "target_agent": target, "task": task}
+        ticket = self._create_approval_ticket(
+            thread_id, reviewer, "review_round_cap",
+            f"Review round cap reached for {review['scope']}", request,
+        )
+        self.queue.transaction(lambda: self.queue.db.execute(
+            "UPDATE review_rounds SET approval_ticket_id=? WHERE thread_id=? AND scope=?",
+            (ticket["id"], thread_id, review["scope"]),
+        ))
+        self.queue.audit("review_round_cap", actor=reviewer, thread_id=thread_id,
+                         ticket_id=ticket["id"], detail=request)
+
+    def dispatch_review_round_cap(self, ticket: dict) -> tuple[list[dict], bool]:
+        request = ticket["payload"]["review_round_cap"]
+        thread_id, scope = request["thread_id"], request["scope"]
+        self.queue.transaction(lambda: self._reset_review_scope(thread_id, scope, ticket["id"]))
+        if not request.get("target_agent"):
+            return [], True
+        started: list[bool] = []
+        replies = self._wake(thread_id, request["target_agent"], request["task"],
+                             "user", "human-approval", run_started=started)
+        if not started:
+            self.queue.transaction(lambda: self._restore_review_scope(
+                thread_id, scope, ticket["id"], int(request["round"])
+            ))
+        return replies, bool(started)
+
+    def _reset_review_scope(self, thread_id: str, scope: str, ticket_id: str) -> None:
+        self.queue.db.execute(
+            "UPDATE review_rounds SET change_count=0,blocked=0,approval_ticket_id=NULL "
+            "WHERE thread_id=? AND scope=?", (thread_id, scope),
+        )
+        self.queue.audit("review_round_reset", actor="human", thread_id=thread_id,
+                         ticket_id=ticket_id, detail={"scope": scope})
+
+    def _restore_review_scope(
+        self, thread_id: str, scope: str, ticket_id: str, count: int
+    ) -> None:
+        self.queue.db.execute(
+            "UPDATE review_rounds SET change_count=?,blocked=1,approval_ticket_id=? "
+            "WHERE thread_id=? AND scope=?", (count, ticket_id, thread_id, scope),
+        )
+        self.queue.audit("review_round_reset_rolled_back", actor="system",
+                         thread_id=thread_id, ticket_id=ticket_id,
+                         detail={"scope": scope, "count": count})
 
     def _record_usage(self, key: str, agent: Agent, *, thread_id: str, **fields) -> None:
         """Accounting must never change the observable outcome of an agent run."""

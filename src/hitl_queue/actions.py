@@ -34,6 +34,23 @@ class Actions:
             }
 
         agent_task = (ticket.get("payload") or {}).get("agent_task")
+        review_cap = (ticket.get("payload") or {}).get("review_round_cap")
+        if ticket["status"] in {"review", "approved"} and review_cap:
+            if ticket["status"] == "review":
+                ticket = self.queue.approve(tid, actor="human", note="continue review loop")
+            try:
+                replies, run_started = self.queue.threads.dispatch_review_round_cap(ticket)
+            except Exception as exc:
+                replies, run_started, reason = [], False, str(exc)
+            else:
+                reason = "no run started"
+            if not run_started:
+                self.queue.audit("review_continue_blocked", actor="human", ticket_id=tid,
+                                 thread_id=review_cap.get("thread_id"), detail={"reason": reason})
+                return {"ok": False, "action": "review_continue_blocked", "id": tid,
+                        "replies": replies, "error": reason}
+            self.queue.done(tid, actor="human", note="review loop continued; count reset")
+            return {"ok": True, "action": "continue_review", "id": tid, "replies": replies}
         if ticket["status"] in {"review", "approved"} and agent_task:
             if ticket["status"] == "review":
                 ticket = self.queue.approve(tid, actor="human", note="approved agent task")

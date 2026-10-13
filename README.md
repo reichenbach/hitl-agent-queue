@@ -105,6 +105,14 @@ Agent-authored `@name task:` mentions require human approval by default and
 self-tasking is always rejected. Set `allow_agent_to_agent = true` on the
 target agent, or on a thread at creation time, only when that relay is wanted.
 
+Reviewer agents can report `VERDICT: CHANGE`, or a structured
+`REVIEW_VERDICT: {"verdict":"CHANGE","branch":"demo-branch","summary":"...","findings":["..."]}`.
+CHANGE counts are durable per branch, ticket, or (when neither is supplied)
+thread. At `max_review_rounds` (default 3; set under `[threads]` in
+`agents.toml`, or in queue config), automatic `@name task:` handoffs for that
+scope stop and a human approval ticket records both positions and open
+findings. Approve to reset the count and continue; skip to leave it stopped.
+
 Agents cannot directly request irreversible or outbound work. They emit one
 JSON line, which creates a normal ticket in `review` for the existing
 approve/skip flow:

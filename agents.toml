@@ -1,3 +1,6 @@
 [agents]
 
+[threads]
+max_review_rounds = 3
+
 # Copy an entry from agents.example.toml here and adjust its allowed folders.
