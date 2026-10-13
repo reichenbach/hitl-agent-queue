@@ -107,13 +107,16 @@ target agent, or on a thread at creation time, only when that relay is wanted.
 
 Reviewer agents can report `VERDICT: CHANGE`, or a structured
 `REVIEW_VERDICT: {"verdict":"CHANGE","branch":"demo-branch","summary":"...","findings":["..."]}`.
-CHANGE counts are durable per thread and the ticket named by a human in that
-thread (or just the thread when no ticket is named). Reviewer-supplied branch
-and ticket fields are display metadata and do not reset the count. At
+CHANGE counts are durable per thread and the most recent ticket named by a
+human in that thread (or just the thread when no ticket is named). Escalation
+approval ticket IDs are ignored when deriving that scope, and reviewer-supplied
+branch and ticket fields are display metadata that do not reset the count. At
 `max_review_rounds` (default 3; set under `[threads]` in
 `agents.toml`, or in queue config), automatic `@name task:` handoffs for that
-scope stop and a human approval ticket records both positions and open
-findings. Approve to reset the count and continue; skip to leave it stopped.
+thread stop if any of its scopes is blocked, and a human approval ticket records
+both positions and open findings. The thread remains blocked until a human
+resolves every blocked scope: approve to reset a scope and continue, or skip to
+leave it stopped.
 
 Agents cannot directly request irreversible or outbound work. They emit one
 JSON line, which creates a normal ticket in `review` for the existing

@@ -139,6 +139,53 @@ class ThreadTests(unittest.TestCase):
         ticket = self.queue.get(self.queue.list(status="review")[0]["id"])
         self.assertEqual(ticket["payload"]["review_round_cap"]["target_agent"], "Reviewer")
 
+    def test_any_blocked_scope_stops_handoff_after_human_names_another_ticket(self):
+        reviewer = FakeAgent(
+            "Reviewer", self.agent.limits,
+            output="VERDICT: CHANGE\n@Helper task: revise",
+            work_dir=self.work, allow_agent_to_agent=True,
+        )
+        self.queue.threads.configure({"Helper": self.agent, "Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(1)
+        thread = self.queue.threads.create("Blocked across scopes", allow_agent_to_agent=True)
+        self.queue.threads.post(
+            thread["id"], "user", "Review TKT-0042\n@Reviewer task: first"
+        )
+        reviewer.result = reviewer.result.__class__(
+            "VERDICT: KEEP\n@Helper task: ship", True, None, 0.0, 1
+        )
+
+        self.queue.threads.post(
+            thread["id"], "user", "Now consider TKT-0043\n@Reviewer task: second"
+        )
+
+        self.assertEqual(self.agent.calls, [])
+        ticket = self.queue.get(self.queue.list(status="review")[0]["id"])
+        self.assertEqual(ticket["payload"]["review_round_cap"]["scope"], "ticket:TKT-0042")
+        self.assertEqual(ticket["payload"]["review_round_cap"]["task"], "ship")
+
+    def test_escalation_ticket_mention_does_not_change_review_scope(self):
+        reviewer = FakeAgent("Reviewer", self.agent.limits, output="VERDICT: CHANGE",
+                             work_dir=self.work)
+        self.queue.threads.configure({"Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(1)
+        thread = self.queue.threads.create("Ignore escalation scope")
+        self.queue.threads.post(
+            thread["id"], "user", "Review TKT-0042\n@Reviewer task: first"
+        )
+        ticket = self.queue.list(status="review")[0]
+
+        self.queue.threads.post(
+            thread["id"], "user", f"What about {ticket['id']}?\n@Reviewer task: again"
+        )
+
+        rows = self.queue.db.execute(
+            "SELECT scope,change_count FROM review_rounds WHERE thread_id=?",
+            (thread["id"],),
+        ).fetchall()
+        self.assertEqual([(row["scope"], row["change_count"]) for row in rows],
+                         [("ticket:TKT-0042", 2)])
+
     def test_reviewer_branch_and_ticket_changes_do_not_reset_human_scope(self):
         reviewer = FakeAgent(
             "Reviewer", self.agent.limits,
@@ -180,6 +227,26 @@ class ThreadTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual((row["change_count"], row["blocked"], row["approval_ticket_id"]),
                          (1, 1, ticket["id"]))
+
+    def test_review_restore_does_not_overwrite_newer_escalation(self):
+        thread = self.queue.threads.create("Concurrent restore")
+        scope = f"thread:{thread['id']}"
+        self.queue.db.execute(
+            "INSERT INTO review_rounds"
+            "(thread_id,scope,change_count,blocked,approval_ticket_id) VALUES(?,?,?,?,?)",
+            (thread["id"], scope, 2, 1, "TKT-0099"),
+        )
+
+        self.queue.threads._restore_review_scope(
+            thread["id"], scope, "TKT-0001", 1
+        )
+
+        row = self.queue.db.execute(
+            "SELECT * FROM review_rounds WHERE thread_id=? AND scope=?",
+            (thread["id"], scope),
+        ).fetchone()
+        self.assertEqual((row["change_count"], row["blocked"], row["approval_ticket_id"]),
+                         (2, 1, "TKT-0099"))
 
     def test_review_dispatch_error_after_run_start_is_not_retryable(self):
         reviewer = FakeAgent("Reviewer", self.agent.limits,

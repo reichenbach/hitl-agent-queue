@@ -445,25 +445,35 @@ class Threads:
         return review
 
     def _review_scope(self, thread_id: str) -> str:
-        """Use only a ticket selected by a human; reviewer metadata is untrusted display data."""
+        """Use the latest non-escalation ticket named by a human."""
+        escalation_ids = {
+            row["approval_ticket_id"].upper()
+            for row in self.queue.db.execute(
+                "SELECT approval_ticket_id FROM review_rounds "
+                "WHERE thread_id=? AND approval_ticket_id IS NOT NULL",
+                (thread_id,),
+            )
+        }
         for message in reversed(self.messages(thread_id)):
             if message["author_type"] != "user":
                 continue
-            match = re.search(r"(?i)(?<![\w-])(TKT-\d+)(?![\w-])", message["body"])
-            if match:
-                return f"ticket:{match.group(1).upper()}"
+            matches = re.findall(r"(?i)(?<![\w-])(TKT-\d+)(?![\w-])", message["body"])
+            for ticket_id in reversed(matches):
+                ticket_id = ticket_id.upper()
+                if ticket_id not in escalation_ids:
+                    return f"ticket:{ticket_id}"
         return f"thread:{thread_id}"
 
     def _blocked_review_scope(self, thread_id: str) -> dict | None:
-        scope = self._review_scope(thread_id)
         row = self.queue.db.execute(
-            "SELECT * FROM review_rounds WHERE thread_id=? AND scope=? AND blocked=1",
-            (thread_id, scope),
+            "SELECT * FROM review_rounds WHERE thread_id=? AND blocked=1 "
+            "ORDER BY scope LIMIT 1",
+            (thread_id,),
         ).fetchone()
         if not row:
             return None
         return {
-            "scope": scope, "round": row["change_count"],
+            "scope": row["scope"], "round": row["change_count"],
             "limit": int(self.queue.cfg.get("max_review_rounds", 3)), "blocked": True,
             "reviewer_summary": "Review scope remains blocked",
             "builder_summary": "Awaiting human approval", "findings": [],
@@ -535,7 +545,9 @@ class Threads:
     ) -> None:
         self.queue.db.execute(
             "UPDATE review_rounds SET change_count=?,blocked=1,approval_ticket_id=? "
-            "WHERE thread_id=? AND scope=?", (count, ticket_id, thread_id, scope),
+            "WHERE thread_id=? AND scope=? "
+            "AND (approval_ticket_id IS NULL OR approval_ticket_id=?)",
+            (count, ticket_id, thread_id, scope, ticket_id),
         )
         self.queue.audit("review_round_reset_rolled_back", actor="system",
                          thread_id=thread_id, ticket_id=ticket_id,
