@@ -69,7 +69,8 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(len(self.agent.calls), 1)
         ticket = self.queue.get(self.queue.list(status="review")[0]["id"])
         request = ticket["payload"]["review_round_cap"]
-        self.assertEqual(request["scope"], "branch:demo-branch")
+        self.assertEqual(request["scope"], f"thread:{thread['id']}")
+        self.assertEqual(request["branch"], "demo-branch")
         self.assertEqual(request["round"], 2)
         self.assertEqual(request["reviewer_summary"], "Needs one more pass")
         self.assertEqual(request["findings"], ["Clarify example"])
@@ -86,7 +87,7 @@ class ThreadTests(unittest.TestCase):
         self.queue.threads.configure({"Helper": self.agent, "Reviewer": reviewer})
         self.queue.threads._set_max_review_rounds(1)
         thread = self.queue.threads.create("Approval reset", allow_agent_to_agent=True)
-        self.queue.threads.post(thread["id"], "user", "@Reviewer task: review")
+        self.queue.threads.post(thread["id"], "user", "Review TKT-0042\n@Reviewer task: review")
         ticket = self.queue.list(status="review")[0]
 
         result = self.queue.actions.approve(ticket["id"], "CODEX")
@@ -100,6 +101,154 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(self.queue.get(ticket["id"])["status"], "done")
         self.assertIn("review_round_reset", [r["event"] for r in self.queue.threads.audit_log()])
 
+    def test_blocked_scope_stops_keep_verdict_handoff(self):
+        reviewer = FakeAgent(
+            "Reviewer", self.agent.limits, output="VERDICT: CHANGE",
+            work_dir=self.work, allow_agent_to_agent=True,
+        )
+        self.queue.threads.configure({"Helper": self.agent, "Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(1)
+        thread = self.queue.threads.create("Blocked KEEP", allow_agent_to_agent=True)
+        self.queue.threads.post(
+            thread["id"], "user", "Review ticket TKT-0042\n@Reviewer task: review"
+        )
+        reviewer.result = reviewer.result.__class__(
+            "VERDICT: KEEP\n@Helper task: ship it", True, None, 0.0, 1
+        )
+
+        self.queue.threads.post(thread["id"], "user", "@Reviewer task: check again")
+
+        self.assertEqual(self.agent.calls, [])
+        ticket = self.queue.get(self.queue.list(status="review")[0]["id"])
+        self.assertEqual(ticket["payload"]["review_round_cap"]["task"], "ship it")
+
+    def test_blocked_scope_stops_builder_tasking_reviewer(self):
+        reviewer = FakeAgent("Reviewer", self.agent.limits, output="VERDICT: CHANGE",
+                             work_dir=self.work, allow_agent_to_agent=True)
+        builder = FakeAgent("Builder", self.agent.limits,
+                            output="@Reviewer task: review revision", work_dir=self.work,
+                            allow_agent_to_agent=True)
+        self.queue.threads.configure({"Builder": builder, "Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(1)
+        thread = self.queue.threads.create("Blocked builder", allow_agent_to_agent=True)
+        self.queue.threads.post(thread["id"], "user", "@Reviewer task: initial review")
+
+        self.queue.threads.post(thread["id"], "user", "@Builder task: revise")
+
+        self.assertEqual(len(reviewer.calls), 1)
+        ticket = self.queue.get(self.queue.list(status="review")[0]["id"])
+        self.assertEqual(ticket["payload"]["review_round_cap"]["target_agent"], "Reviewer")
+
+    def test_reviewer_branch_and_ticket_changes_do_not_reset_human_scope(self):
+        reviewer = FakeAgent(
+            "Reviewer", self.agent.limits,
+            output=('REVIEW_VERDICT: {"verdict":"CHANGE","ticket_id":"TKT-9999",'
+                    '"branch":"old"}'), work_dir=self.work,
+        )
+        self.queue.threads.configure({"Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(2)
+        thread = self.queue.threads.create("Stable scope")
+        self.queue.threads.post(thread["id"], "user", "For TKT-0042\n@Reviewer task: one")
+        reviewer.result = reviewer.result.__class__(
+            'VERDICT: {"verdict":"CHANGE","ticket_id":"TKT-1234","branch":"new"}',
+            True, None, 0.0, 1,
+        )
+
+        self.queue.threads.post(thread["id"], "user", "@Reviewer task: two")
+
+        rows = self.queue.db.execute(
+            "SELECT * FROM review_rounds WHERE thread_id=?", (thread["id"],)
+        ).fetchall()
+        self.assertEqual([(row["scope"], row["change_count"]) for row in rows],
+                         [("ticket:TKT-0042", 2)])
+
+    def test_review_reset_is_restored_when_dispatch_raises_before_run(self):
+        reviewer = FakeAgent("Reviewer", self.agent.limits,
+                             output="VERDICT: CHANGE\n@Helper task: revise",
+                             work_dir=self.work, allow_agent_to_agent=True)
+        self.queue.threads.configure({"Helper": self.agent, "Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(1)
+        thread = self.queue.threads.create("Restore scope", allow_agent_to_agent=True)
+        self.queue.threads.post(thread["id"], "user", "@Reviewer task: review")
+        ticket = self.queue.get(self.queue.list(status="review")[0]["id"])
+        with mock.patch.object(self.queue.threads, "_wake", side_effect=RuntimeError("boom")):
+            result = self.queue.actions.approve(ticket["id"], "CODEX")
+
+        self.assertEqual(result["action"], "review_continue_blocked")
+        row = self.queue.db.execute(
+            "SELECT * FROM review_rounds WHERE thread_id=?", (thread["id"],)
+        ).fetchone()
+        self.assertEqual((row["change_count"], row["blocked"], row["approval_ticket_id"]),
+                         (1, 1, ticket["id"]))
+
+    def test_review_dispatch_error_after_run_start_is_not_retryable(self):
+        reviewer = FakeAgent("Reviewer", self.agent.limits,
+                             output="VERDICT: CHANGE\n@Helper task: revise", work_dir=self.work,
+                             allow_agent_to_agent=True)
+        self.queue.threads.configure({"Helper": self.agent, "Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(1)
+        thread = self.queue.threads.create("Started dispatch", allow_agent_to_agent=True)
+        self.queue.threads.post(thread["id"], "user", "Review TKT-0042\n@Reviewer task: review")
+        ticket = self.queue.list(status="review")[0]
+        with mock.patch.object(self.queue.threads, "_append_message",
+                               side_effect=RuntimeError("after start")):
+            result = self.queue.actions.approve(ticket["id"], "CODEX")
+
+        self.assertEqual(result["action"], "continue_review")
+        self.assertEqual(len(self.agent.calls), 1)
+        self.assertEqual(self.queue.get(ticket["id"])["status"], "done")
+
+    def test_terminal_escalation_payload_is_not_updated(self):
+        reviewer = FakeAgent("Reviewer", self.agent.limits,
+                             output="VERDICT: CHANGE\n@Helper task: first", work_dir=self.work,
+                             allow_agent_to_agent=True)
+        self.queue.threads.configure({"Helper": self.agent, "Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(1)
+        thread = self.queue.threads.create("Terminal escalation", allow_agent_to_agent=True)
+        self.queue.threads.post(thread["id"], "user", "@Reviewer task: review")
+        ticket = self.queue.get(self.queue.list(status="review")[0]["id"])
+        before = ticket["payload"]
+        self.queue.actions.skip(ticket["id"])
+
+        self.queue.threads._hold_review_handoff(
+            thread["id"], {"scope": f"thread:{thread['id']}"},
+            "Builder", "Helper", "second",
+        )
+
+        self.assertEqual(self.queue.get(ticket["id"])["payload"], before)
+
+    def test_concurrent_cap_crossings_create_one_linked_escalation(self):
+        reviewer = FakeAgent("Reviewer", self.agent.limits, output="VERDICT: CHANGE",
+                             work_dir=self.work)
+        self.queue.threads.configure({"Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(1)
+        thread = self.queue.threads.create("Concurrent cap", max_agent_runs=2)
+        barrier = threading.Barrier(3)
+        errors = []
+
+        def review():
+            try:
+                barrier.wait()
+                self.queue.threads.post(thread["id"], "user", "@Reviewer task: review")
+            except BaseException as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=review) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        tickets = self.queue.list(status="review")
+        self.assertEqual(len(tickets), 1)
+        row = self.queue.db.execute(
+            "SELECT * FROM review_rounds WHERE thread_id=?", (thread["id"],)
+        ).fetchone()
+        self.assertEqual(row["approval_ticket_id"], tickets[0]["id"])
+
     def test_review_cap_skip_leaves_scope_blocked(self):
         reviewer = FakeAgent(
             "Reviewer", self.agent.limits,
@@ -109,7 +258,7 @@ class ThreadTests(unittest.TestCase):
         self.queue.threads.configure({"Helper": self.agent, "Reviewer": reviewer})
         self.queue.threads._set_max_review_rounds(1)
         thread = self.queue.threads.create("Skip cap", allow_agent_to_agent=True)
-        self.queue.threads.post(thread["id"], "user", "@Reviewer task: review")
+        self.queue.threads.post(thread["id"], "user", "Review TKT-0042\n@Reviewer task: review")
         ticket = self.queue.list(status="review")[0]
 
         self.queue.actions.skip(ticket["id"])
@@ -131,7 +280,9 @@ class ThreadTests(unittest.TestCase):
         self.queue.threads._set_max_review_rounds(1)
         thread = self.queue.threads.create("No automatic handoff")
 
-        self.queue.threads.post(thread["id"], "user", "@Reviewer task: review")
+        self.queue.threads.post(
+            thread["id"], "user", "Review ticket TKT-0042\n@Reviewer task: review"
+        )
 
         ticket = self.queue.get(self.queue.list(status="review")[0]["id"])
         self.assertEqual(ticket["payload"]["review_round_cap"]["scope"], "ticket:TKT-0042")

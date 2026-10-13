@@ -107,8 +107,10 @@ target agent, or on a thread at creation time, only when that relay is wanted.
 
 Reviewer agents can report `VERDICT: CHANGE`, or a structured
 `REVIEW_VERDICT: {"verdict":"CHANGE","branch":"demo-branch","summary":"...","findings":["..."]}`.
-CHANGE counts are durable per branch, ticket, or (when neither is supplied)
-thread. At `max_review_rounds` (default 3; set under `[threads]` in
+CHANGE counts are durable per thread and the ticket named by a human in that
+thread (or just the thread when no ticket is named). Reviewer-supplied branch
+and ticket fields are display metadata and do not reset the count. At
+`max_review_rounds` (default 3; set under `[threads]` in
 `agents.toml`, or in queue config), automatic `@name task:` handoffs for that
 scope stop and a human approval ticket records both positions and open
 findings. Approve to reset the count and continue; skip to leave it stopped.

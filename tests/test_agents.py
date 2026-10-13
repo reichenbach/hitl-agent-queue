@@ -146,6 +146,22 @@ timeout_seconds = 10
         finally:
             queue.close()
 
+    def test_threads_config_without_round_cap_preserves_queue_config(self):
+        from hitl_queue import Queue
+
+        (self.root / "work").mkdir()
+        config = self.root / "agents.toml"
+        config.write_text(
+            "[agents.worker]\ntype='fake'\nallowed_folders=['work']\n"
+            "work_dir='work'\nmax_turns=1\ntimeout_seconds=1\n"
+        )
+        queue = Queue(self.root / "state", config={"max_review_rounds": 7})
+        try:
+            queue.threads.configure_from(config)
+            self.assertEqual(queue.cfg["max_review_rounds"], 7)
+        finally:
+            queue.close()
+
     def test_folder_enforcement(self):
         outside = self.root.parent / "not-allowed"
         result = FakeAgent("fake", self.limits).run("hello", outside)

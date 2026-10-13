@@ -131,8 +131,9 @@ class Threads:
 
         with Path(path).expanduser().open("rb") as handle:
             document = tomllib.load(handle)
-        value = (document.get("threads") or {}).get("max_review_rounds", 3)
-        self._set_max_review_rounds(value)
+        threads_config = document.get("threads") or {}
+        if "max_review_rounds" in threads_config:
+            self._set_max_review_rounds(threads_config["max_review_rounds"])
         self.configure(load_agents(path))
 
     def _set_max_review_rounds(self, value: int) -> None:
@@ -247,6 +248,12 @@ class Threads:
                     detail={"reason": "self_task", "target": agent.name},
                 )
                 return []
+            blocked = self._blocked_review_scope(thread_id)
+            if blocked:
+                self._hold_review_handoff(
+                    thread_id, blocked, source_name, agent.name, task
+                )
+                return []
             thread = self.get(thread_id)
             if not (thread["allow_agent_to_agent"] or agent.allow_agent_to_agent):
                 self._create_approval_ticket(
@@ -352,11 +359,6 @@ class Threads:
                             detail={"target": target, "kind": "task"},
                         )
                         continue
-                    if review and review["blocked"]:
-                        self._hold_review_handoff(
-                            thread_id, review, agent.name, target, mention.group("body")
-                        )
-                        continue
                     replies.extend(self._wake(
                         thread_id, target, mention.group("body"), "agent", agent.name,
                     ))
@@ -381,12 +383,9 @@ class Threads:
             data["verdict"] = raw.split()[0] if raw else ""
         if str(data.get("verdict", "")).upper() != "CHANGE":
             return None
-        ticket_id = str(data.get("ticket_id", "")).upper()
         raw_branch = str(data.get("branch", "")).strip()
         branch = self._sanitize_summary(raw_branch) if raw_branch else ""
-        scope = f"ticket:{ticket_id}" if re.fullmatch(r"TKT-\d+", ticket_id) else (
-            f"branch:{branch}" if branch else f"thread:{thread_id}"
-        )
+        scope = self._review_scope(thread_id)
         summary = self._sanitize_summary(str(data.get("summary") or output))
         findings = data.get("findings", [])
         if not isinstance(findings, list):
@@ -420,52 +419,81 @@ class Threads:
             return {"scope": scope, "round": row["change_count"], "limit": limit,
                     "blocked": blocked, "reviewer_summary": summary,
                     "builder_summary": builder_summary, "findings": findings,
+                    "branch": branch,
                     "newly_blocked": blocked and not bool(row["blocked"])}
 
-        review = self.queue.transaction(record)
-        if review["newly_blocked"]:
-            ticket = self._create_approval_ticket(
-                thread_id, reviewer, "review_round_cap",
-                f"Review round cap reached for {review['scope']}", review,
-            )
-            self.queue.transaction(lambda: self.queue.db.execute(
-                "UPDATE review_rounds SET approval_ticket_id=? WHERE thread_id=? AND scope=?",
-                (ticket["id"], thread_id, review["scope"]),
-            ))
-            self.queue.audit("review_round_cap", actor=reviewer, thread_id=thread_id,
-                             ticket_id=ticket["id"], detail=review)
+        def record_and_escalate():
+            review = record()
+            ticket = None
+            if review["newly_blocked"]:
+                ticket = self._insert_approval_ticket(
+                    thread_id, reviewer, "review_round_cap",
+                    f"Review round cap reached for {review['scope']}", review,
+                )
+                self.queue.db.execute(
+                    "UPDATE review_rounds SET approval_ticket_id=? "
+                    "WHERE thread_id=? AND scope=? AND approval_ticket_id IS NULL",
+                    (ticket["id"], thread_id, review["scope"]),
+                )
+                self.queue.audit("review_round_cap", actor=reviewer, thread_id=thread_id,
+                                 ticket_id=ticket["id"], detail=review)
+            return review, ticket
+
+        review, ticket = self.queue.transaction(record_and_escalate)
+        if ticket:
+            self._notify_approval_ticket(ticket)
         return review
+
+    def _review_scope(self, thread_id: str) -> str:
+        """Use only a ticket selected by a human; reviewer metadata is untrusted display data."""
+        for message in reversed(self.messages(thread_id)):
+            if message["author_type"] != "user":
+                continue
+            match = re.search(r"(?i)(?<![\w-])(TKT-\d+)(?![\w-])", message["body"])
+            if match:
+                return f"ticket:{match.group(1).upper()}"
+        return f"thread:{thread_id}"
+
+    def _blocked_review_scope(self, thread_id: str) -> dict | None:
+        scope = self._review_scope(thread_id)
+        row = self.queue.db.execute(
+            "SELECT * FROM review_rounds WHERE thread_id=? AND scope=? AND blocked=1",
+            (thread_id, scope),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "scope": scope, "round": row["change_count"],
+            "limit": int(self.queue.cfg.get("max_review_rounds", 3)), "blocked": True,
+            "reviewer_summary": "Review scope remains blocked",
+            "builder_summary": "Awaiting human approval", "findings": [],
+        }
 
     def _hold_review_handoff(
         self, thread_id: str, review: dict, reviewer: str, target: str, task: str
     ) -> None:
-        row = self.queue.db.execute(
-            "SELECT approval_ticket_id FROM review_rounds WHERE thread_id=? AND scope=?",
-            (thread_id, review["scope"]),
-        ).fetchone()
-        if row and row["approval_ticket_id"]:
+        def hold():
+            row = self.queue.db.execute(
+                "SELECT approval_ticket_id FROM review_rounds WHERE thread_id=? AND scope=?",
+                (thread_id, review["scope"]),
+            ).fetchone()
+            if not row or not row["approval_ticket_id"]:
+                return None
             ticket = self.queue.get(row["approval_ticket_id"])
+            if ticket["status"] not in {"review", "approved"}:
+                return None
             payload = ticket["payload"]
             payload["review_round_cap"].update({"target_agent": target, "task": task})
             self.queue.db.execute(
-                "UPDATE tickets SET payload=?,updated=? WHERE id=?",
+                "UPDATE tickets SET payload=?,updated=? WHERE id=? "
+                "AND status IN ('review','approved')",
                 (json.dumps(payload, sort_keys=True), time.time(), ticket["id"]),
             )
             self.queue.audit("review_handoff_blocked", actor=reviewer, thread_id=thread_id,
-                             ticket_id=row["approval_ticket_id"],
+                             ticket_id=ticket["id"],
                              detail={"scope": review["scope"], "target": target})
-            return
-        request = {**review, "target_agent": target, "task": task}
-        ticket = self._create_approval_ticket(
-            thread_id, reviewer, "review_round_cap",
-            f"Review round cap reached for {review['scope']}", request,
-        )
-        self.queue.transaction(lambda: self.queue.db.execute(
-            "UPDATE review_rounds SET approval_ticket_id=? WHERE thread_id=? AND scope=?",
-            (ticket["id"], thread_id, review["scope"]),
-        ))
-        self.queue.audit("review_round_cap", actor=reviewer, thread_id=thread_id,
-                         ticket_id=ticket["id"], detail=request)
+            return ticket
+        self.queue.transaction(hold)
 
     def dispatch_review_round_cap(self, ticket: dict) -> tuple[list[dict], bool]:
         request = ticket["payload"]["review_round_cap"]
@@ -474,8 +502,20 @@ class Threads:
         if not request.get("target_agent"):
             return [], True
         started: list[bool] = []
-        replies = self._wake(thread_id, request["target_agent"], request["task"],
-                             "user", "human-approval", run_started=started)
+        try:
+            replies = self._wake(thread_id, request["target_agent"], request["task"],
+                                 "user", "human-approval", run_started=started)
+        except Exception as exc:
+            if not started:
+                self.queue.transaction(lambda: self._restore_review_scope(
+                    thread_id, scope, ticket["id"], int(request["round"])
+                ))
+                raise
+            self.queue.audit(
+                "review_round_dispatch_error", actor="human", ticket_id=ticket.get("id"),
+                thread_id=thread_id, detail={"error": str(exc)},
+            )
+            return [], True
         if not started:
             self.queue.transaction(lambda: self._restore_review_scope(
                 thread_id, scope, ticket["id"], int(request["round"])
@@ -651,40 +691,44 @@ class Threads:
     def _create_approval_ticket(
         self, thread_id: str, agent: str, request_type: str, title: str, request: dict
     ) -> dict:
-        clean_title = self._sanitize_summary(title)
-
         def create():
-            ticket_id = self.queue._next_id()
-            stamp = time.time()
-            payload = {
-                "reason": f"Agent request from {agent} in {thread_id}",
-                "artifacts": {},
-                "notes": "",
-                request_type: {**request, "thread_id": thread_id},
-            }
-            self.queue.db.execute(
-                "INSERT INTO tickets(id,kind,status,title,company,url,owner,payload,created,updated) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (ticket_id, "task", "review", clean_title, "", None, agent,
-                 json.dumps(payload, sort_keys=True), stamp, stamp),
+            return self._insert_approval_ticket(
+                thread_id, agent, request_type, title, request
             )
-            self.queue._event(ticket_id, "new", agent, payload["reason"])
-            self.queue._event(ticket_id, "drafting", agent, "claimed by agent")
-            self.queue._event(ticket_id, "review", agent, "requires human approval")
-            self.queue.audit(
-                "approval_requested", actor=agent, thread_id=thread_id,
-                ticket_id=ticket_id, detail={**request, "type": request_type},
-            )
-            return self.queue.get(ticket_id)
 
         ticket = self.queue.transaction(create)
+        self._notify_approval_ticket(ticket)
+        return ticket
+
+    def _insert_approval_ticket(
+        self, thread_id: str, agent: str, request_type: str, title: str, request: dict
+    ) -> dict:
+        ticket_id = self.queue._next_id()
+        stamp = time.time()
+        payload = {
+            "reason": f"Agent request from {agent} in {thread_id}", "artifacts": {}, "notes": "",
+            request_type: {**request, "thread_id": thread_id},
+        }
+        self.queue.db.execute(
+            "INSERT INTO tickets(id,kind,status,title,company,url,owner,payload,created,updated) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (ticket_id, "task", "review", self._sanitize_summary(title), "", None, agent,
+             json.dumps(payload, sort_keys=True), stamp, stamp),
+        )
+        self.queue._event(ticket_id, "new", agent, payload["reason"])
+        self.queue._event(ticket_id, "drafting", agent, "claimed by agent")
+        self.queue._event(ticket_id, "review", agent, "requires human approval")
+        self.queue.audit("approval_requested", actor=agent, thread_id=thread_id,
+                         ticket_id=ticket_id, detail={**request, "type": request_type})
+        return self.queue.get(ticket_id)
+
+    def _notify_approval_ticket(self, ticket: dict) -> None:
         self.queue._notify(
             f"{ticket['id']} ready\n - {ticket['title']}\n"
             f"Reply:\nAPPROVE {ticket['id']} CODEX\n"
             f"APPROVE {ticket['id']} CLAUDE\nSKIP {ticket['id']}",
             source="hitl-review",
         )
-        return ticket
 
     def dispatch_approved_agent_task(self, ticket: dict) -> tuple[list[dict], bool]:
         request = ticket["payload"]["agent_task"]
