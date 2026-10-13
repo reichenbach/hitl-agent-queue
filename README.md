@@ -115,8 +115,12 @@ branch and ticket fields are display metadata that do not reset the count. At
 `agents.toml`, or in queue config), automatic `@name task:` handoffs for that
 thread stop if any of its scopes is blocked, and a human approval ticket records
 both positions and open findings. The thread remains blocked until a human
-resolves every blocked scope: approve to reset a scope and continue, or skip to
-leave it stopped.
+resolves every blocked scope. `APPROVE TKT-ID CODEX|CLAUDE` resets that scope's
+round count and continues its held handoff (when present); `SKIP TKT-ID` closes
+and resolves that scope without dispatching the held handoff. Resolved and
+skipped scopes no longer block other handoffs. Escalation ticket IDs remain
+recorded after either decision so later human mentions of them cannot become a
+new review scope.
 
 Agents cannot directly request irreversible or outbound work. They emit one
 JSON line, which creates a normal ticket in `review` for the existing

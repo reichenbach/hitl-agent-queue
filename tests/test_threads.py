@@ -283,6 +283,24 @@ class ThreadTests(unittest.TestCase):
         )
 
         self.assertEqual(self.queue.get(ticket["id"])["payload"], before)
+        held = [row for row in self.queue.threads.audit_log(thread["id"])
+                if row["event"] == "review_handoff_blocked"]
+        self.assertEqual(held[-1]["detail"]["reason"], "missing escalation ticket")
+
+    def test_blocking_scope_prefers_a_live_escalation_ticket(self):
+        reviewer = FakeAgent("Reviewer", self.agent.limits, output="VERDICT: CHANGE",
+                             work_dir=self.work)
+        self.queue.threads.configure({"Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(1)
+        thread = self.queue.threads.create("Prefer live escalation")
+        self.queue.threads.post(thread["id"], "user", "TKT-0001\n@Reviewer task: first")
+        stale = self.queue.list(status="review")[0]
+        self.queue.done(stale["id"], actor="test", note="closed without resolving scope")
+        self.queue.threads.post(thread["id"], "user", "TKT-9999\n@Reviewer task: second")
+
+        blocked = self.queue.threads._blocked_review_scope(thread["id"])
+
+        self.assertEqual(blocked["scope"], "ticket:TKT-9999")
 
     def test_concurrent_cap_crossings_create_one_linked_escalation(self):
         reviewer = FakeAgent("Reviewer", self.agent.limits, output="VERDICT: CHANGE",
@@ -316,7 +334,7 @@ class ThreadTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["approval_ticket_id"], tickets[0]["id"])
 
-    def test_review_cap_skip_leaves_scope_blocked(self):
+    def test_review_cap_skip_resolves_scope_and_unblocks_handoffs(self):
         reviewer = FakeAgent(
             "Reviewer", self.agent.limits,
             output="VERDICT: CHANGE\n@Helper task: revise neutral sample",
@@ -333,8 +351,35 @@ class ThreadTests(unittest.TestCase):
         row = self.queue.db.execute(
             "SELECT * FROM review_rounds WHERE thread_id=?", (thread["id"],)
         ).fetchone()
-        self.assertEqual(row["blocked"], 1)
+        self.assertEqual((row["blocked"], row["resolved"]), (0, 1))
+        self.assertEqual(row["approval_ticket_id"], None)
+        self.assertEqual(row["escalation_ticket_id"], ticket["id"])
         self.assertEqual(self.queue.get(ticket["id"])["status"], "skipped")
+        self.queue.threads._wake(
+            thread["id"], "Helper", "continue", "agent", "Reviewer"
+        )
+        self.assertEqual(len(self.agent.calls), 1)
+        events = [row["event"] for row in self.queue.threads.audit_log(thread["id"])]
+        self.assertIn("review_round_resolved", events)
+
+    def test_approved_escalation_id_stays_ignored_for_scope_derivation(self):
+        reviewer = FakeAgent("Reviewer", self.agent.limits, output="VERDICT: CHANGE",
+                             work_dir=self.work)
+        self.queue.threads.configure({"Reviewer": reviewer})
+        self.queue.threads._set_max_review_rounds(1)
+        thread = self.queue.threads.create("Durable escalation id")
+        self.queue.threads.post(thread["id"], "user", "TKT-0042\n@Reviewer task: first")
+        ticket = self.queue.list(status="review")[0]
+        self.queue.actions.approve(ticket["id"], "CODEX")
+
+        self.queue.threads.post(
+            thread["id"], "user", f"Regarding {ticket['id']}\n@Reviewer task: second"
+        )
+
+        scopes = [row["scope"] for row in self.queue.db.execute(
+            "SELECT scope FROM review_rounds WHERE thread_id=?", (thread["id"],)
+        )]
+        self.assertEqual(scopes, ["ticket:TKT-0042"])
 
     def test_cap_creates_approval_even_without_handoff_mention(self):
         reviewer = FakeAgent(

@@ -415,11 +415,17 @@ class Queue:
 
     def skip(self, tid: str, *, actor: str = "human", note: str = "") -> dict:
         def action():
+            before = self.get(tid)
             ticket = self._set(tid, "skipped", actor, note or "skipped")
             self.audit(
                 "approval", actor=actor, ticket_id=tid,
                 detail={"decision": "skip", "note": note or "skipped"},
             )
+            review_cap = (before.get("payload") or {}).get("review_round_cap")
+            if review_cap:
+                self.threads.resolve_review_scope(
+                    review_cap["thread_id"], review_cap["scope"], tid
+                )
             return ticket
 
         ticket = self.transaction(action)

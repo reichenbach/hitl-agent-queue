@@ -75,8 +75,17 @@ class Threads:
               scope TEXT NOT NULL,
               change_count INTEGER NOT NULL DEFAULT 0,
               blocked INTEGER NOT NULL DEFAULT 0,
+              resolved INTEGER NOT NULL DEFAULT 0,
               approval_ticket_id TEXT,
+              escalation_ticket_id TEXT,
               PRIMARY KEY(thread_id, scope)
+            );
+            CREATE TABLE IF NOT EXISTS review_escalations(
+              thread_id TEXT NOT NULL REFERENCES threads(id),
+              scope TEXT NOT NULL,
+              ticket_id TEXT NOT NULL UNIQUE,
+              created REAL NOT NULL,
+              PRIMARY KEY(thread_id, scope, ticket_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(
               seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,6 +122,27 @@ class Threads:
             self.queue.db.execute(
                 "ALTER TABLE threads ADD COLUMN allow_agent_to_agent INTEGER NOT NULL DEFAULT 0"
             )
+        review_columns = {
+            row["name"] for row in self.queue.db.execute("PRAGMA table_info(review_rounds)")
+        }
+        if "resolved" not in review_columns:
+            self.queue.db.execute(
+                "ALTER TABLE review_rounds ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0"
+            )
+        if "escalation_ticket_id" not in review_columns:
+            self.queue.db.execute(
+                "ALTER TABLE review_rounds ADD COLUMN escalation_ticket_id TEXT"
+            )
+        self.queue.db.execute(
+            "UPDATE review_rounds SET escalation_ticket_id=approval_ticket_id "
+            "WHERE escalation_ticket_id IS NULL AND approval_ticket_id IS NOT NULL"
+        )
+        self.queue.db.execute(
+            "INSERT OR IGNORE INTO review_escalations(thread_id,scope,ticket_id,created) "
+            "SELECT thread_id,scope,escalation_ticket_id,? FROM review_rounds "
+            "WHERE escalation_ticket_id IS NOT NULL",
+            (time.time(),),
+        )
         self._set_max_review_rounds(self.queue.cfg.get("max_review_rounds", 3))
 
     def configure(self, agents: dict[str, Agent]) -> None:
@@ -399,7 +429,8 @@ class Threads:
         def record():
             self.queue.db.execute(
                 "INSERT INTO review_rounds(thread_id,scope,change_count) VALUES(?,?,1) "
-                "ON CONFLICT(thread_id,scope) DO UPDATE SET change_count=change_count+1",
+                "ON CONFLICT(thread_id,scope) DO UPDATE SET "
+                "change_count=change_count+1,resolved=0",
                 (thread_id, scope),
             )
             row = self.queue.db.execute(
@@ -431,9 +462,14 @@ class Threads:
                     f"Review round cap reached for {review['scope']}", review,
                 )
                 self.queue.db.execute(
-                    "UPDATE review_rounds SET approval_ticket_id=? "
+                    "UPDATE review_rounds SET approval_ticket_id=?,escalation_ticket_id=? "
                     "WHERE thread_id=? AND scope=? AND approval_ticket_id IS NULL",
-                    (ticket["id"], thread_id, review["scope"]),
+                    (ticket["id"], ticket["id"], thread_id, review["scope"]),
+                )
+                self.queue.db.execute(
+                    "INSERT OR IGNORE INTO review_escalations"
+                    "(thread_id,scope,ticket_id,created) VALUES(?,?,?,?)",
+                    (thread_id, review["scope"], ticket["id"], time.time()),
                 )
                 self.queue.audit("review_round_cap", actor=reviewer, thread_id=thread_id,
                                  ticket_id=ticket["id"], detail=review)
@@ -447,10 +483,9 @@ class Threads:
     def _review_scope(self, thread_id: str) -> str:
         """Use the latest non-escalation ticket named by a human."""
         escalation_ids = {
-            row["approval_ticket_id"].upper()
+            row["ticket_id"].upper()
             for row in self.queue.db.execute(
-                "SELECT approval_ticket_id FROM review_rounds "
-                "WHERE thread_id=? AND approval_ticket_id IS NOT NULL",
+                "SELECT ticket_id FROM review_escalations WHERE thread_id=?",
                 (thread_id,),
             )
         }
@@ -466,8 +501,11 @@ class Threads:
 
     def _blocked_review_scope(self, thread_id: str) -> dict | None:
         row = self.queue.db.execute(
-            "SELECT * FROM review_rounds WHERE thread_id=? AND blocked=1 "
-            "ORDER BY scope LIMIT 1",
+            "SELECT review_rounds.* FROM review_rounds "
+            "LEFT JOIN tickets ON tickets.id=review_rounds.approval_ticket_id "
+            "WHERE thread_id=? AND blocked=1 AND resolved=0 "
+            "ORDER BY CASE WHEN tickets.status IN ('review','approved') THEN 0 ELSE 1 END, "
+            "scope LIMIT 1",
             (thread_id,),
         ).fetchone()
         if not row:
@@ -488,9 +526,20 @@ class Threads:
                 (thread_id, review["scope"]),
             ).fetchone()
             if not row or not row["approval_ticket_id"]:
+                self.queue.audit(
+                    "review_handoff_blocked", actor=reviewer, thread_id=thread_id,
+                    detail={"scope": review["scope"], "target": target,
+                            "reason": "missing escalation ticket"},
+                )
                 return None
             ticket = self.queue.get(row["approval_ticket_id"])
             if ticket["status"] not in {"review", "approved"}:
+                self.queue.audit(
+                    "review_handoff_blocked", actor=reviewer, thread_id=thread_id,
+                    ticket_id=ticket["id"],
+                    detail={"scope": review["scope"], "target": target,
+                            "reason": f"escalation ticket is {ticket['status']}"},
+                )
                 return None
             payload = ticket["payload"]
             payload["review_round_cap"].update({"target_agent": target, "task": task})
@@ -534,20 +583,34 @@ class Threads:
 
     def _reset_review_scope(self, thread_id: str, scope: str, ticket_id: str) -> None:
         self.queue.db.execute(
-            "UPDATE review_rounds SET change_count=0,blocked=0,approval_ticket_id=NULL "
+            "UPDATE review_rounds SET change_count=0,blocked=0,resolved=0,approval_ticket_id=NULL "
             "WHERE thread_id=? AND scope=?", (thread_id, scope),
         )
         self.queue.audit("review_round_reset", actor="human", thread_id=thread_id,
                          ticket_id=ticket_id, detail={"scope": scope})
 
+    def resolve_review_scope(self, thread_id: str, scope: str, ticket_id: str) -> None:
+        """Resolve a capped scope after the human skips its escalation ticket."""
+        self.queue.db.execute(
+            "UPDATE review_rounds SET blocked=0,resolved=1,approval_ticket_id=NULL "
+            "WHERE thread_id=? AND scope=? "
+            "AND (approval_ticket_id=? OR escalation_ticket_id=?)",
+            (thread_id, scope, ticket_id, ticket_id),
+        )
+        self.queue.audit(
+            "review_round_resolved", actor="human", thread_id=thread_id,
+            ticket_id=ticket_id, detail={"scope": scope, "decision": "skip"},
+        )
+
     def _restore_review_scope(
         self, thread_id: str, scope: str, ticket_id: str, count: int
     ) -> None:
         self.queue.db.execute(
-            "UPDATE review_rounds SET change_count=?,blocked=1,approval_ticket_id=? "
+            "UPDATE review_rounds SET change_count=?,blocked=1,resolved=0,approval_ticket_id=?, "
+            "escalation_ticket_id=COALESCE(escalation_ticket_id,?) "
             "WHERE thread_id=? AND scope=? "
             "AND (approval_ticket_id IS NULL OR approval_ticket_id=?)",
-            (count, ticket_id, thread_id, scope, ticket_id),
+            (count, ticket_id, ticket_id, thread_id, scope, ticket_id),
         )
         self.queue.audit("review_round_reset_rolled_back", actor="system",
                          thread_id=thread_id, ticket_id=ticket_id,

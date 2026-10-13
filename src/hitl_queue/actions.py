@@ -117,6 +117,12 @@ class Actions:
 
     def skip(self, ticket_id: str) -> dict:
         tid = ticket_id.upper()
+        ticket = self.queue.get(tid)
+        review_cap = (ticket.get("payload") or {}).get("review_round_cap")
         self.queue.skip(tid, actor="human", note="SKIP via reply")
-        notification = self.queue._notify(f"Skipped {tid}", source="hitl-reply")
-        return {"ok": True, "action": "skip", "id": tid, "notification": notification}
+        suffix = "; review scope resolved" if review_cap else ""
+        notification = self.queue._notify(f"Skipped {tid}{suffix}", source="hitl-reply")
+        result = {"ok": True, "action": "skip", "id": tid, "notification": notification}
+        if review_cap:
+            result["resolved_scope"] = review_cap["scope"]
+        return result
