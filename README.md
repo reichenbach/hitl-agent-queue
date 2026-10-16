@@ -193,15 +193,63 @@ The build is unsigned. The first time you launch it, right-click
 
 ## Tray app
 
-The optional tray/menu-bar app shows review tickets awaiting approval, running
-agents, and quota bars. Approve and Skip operate on the configured public queue;
-**Open app** starts the existing synthetic desktop board in a separate process.
+A menu-bar (macOS) / system-tray (Windows, Linux) icon over the same queue.
+
+![Tray menu with pending approvals, a running agent, and usage bars](docs/images/tray-menu.png)
+
+*Rendered from the tray's real menu model (`TrayModel` in
+`src/hitl_queue/tray.py`) with neutral demo data by
+`scripts/render_tray_menu.py`; submenus are drawn expanded side by side.*
+
+The menu re-reads the queue every 5 seconds and after every action:
+
+| Item | Shows / does |
+|---|---|
+| **Pending approvals** | One submenu per ticket in `review`, labelled `TKT-ID — title` (single line, max 60 chars). Each has **Approve → codex\|claude** — the ticket's preferred worker, else `default_apply_worker`, else `codex` — and **Skip**. Both go through `queue.actions`, the same path as the reply grammar. |
+| **Running agents** | Read-only rows `Agent — THR-ID (status)` for thread runs still `running` or `killing`. |
+| **Usage** | One read-only row per configured agent: a 10-cell bar of its highest used percentage across runs / minutes / tokens, e.g. `Alpha [####------] 40%`, with ` WARN` or ` BLOCKED` at the plan thresholds. |
+| `Error: …` | Appears only when reading state or the last action failed; polling keeps going. |
+| **Open app** | Starts the desktop board (`python3 -m hitl_queue app`, synthetic data) in a separate process. |
+| **Refresh** / **Quit** | Re-read now / stop polling and remove the icon. |
+
+Empty sections show a disabled `None` (or `No usage plans`) row. Agents and
+plans come from `agents.toml` in the working directory, if present.
 
 ```bash
-pip install -e ".[tray]"
-python3 -m hitl_queue tray                 # uses --state-dir (default: state)
-python3 -m hitl_queue tray --demo          # neutral throwaway demo data only
+pip install -e ".[tray]"                           # pystray + Pillow
+python3 -m hitl_queue tray                         # state dir: ./state
+python3 -m hitl_queue tray --state-dir path/to/state
+python3 -m hitl_queue --state-dir path/to/state tray   # same; either position works
+python3 -m hitl_queue tray --demo                  # neutral throwaway demo data only
 ```
+
+`--demo` ignores `--state-dir` and never touches a real queue. The `tray`
+extra installs `pystray` and `Pillow` (pystray brings in PyObjC on macOS);
+Linux also needs the system packages listed below.
+
+**Default data dir (packaged builds).** Run from source, the tray uses
+`--state-dir` or `./state`. The bundled `HITL Tray` app/executable has no
+working directory to rely on, so it reads `state/` and `agents.toml` from the
+per-user data folder:
+
+| OS | Folder |
+|---|---|
+| macOS | `~/Library/Application Support/HITL Queue/` |
+| Windows | `%APPDATA%\HITL Queue\` |
+| Linux | `$XDG_DATA_HOME/hitl-queue/` (default `~/.local/share/hitl-queue/`) |
+
+An explicit `--state-dir` still wins.
+
+To regenerate the screenshot (no pystray, no window opened):
+
+```bash
+python3 scripts/render_tray_menu.py --output /tmp/tray-menu.html   # prints the path
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless \
+  --hide-scrollbars --window-size=900,240 \
+  --screenshot="$PWD/docs/images/tray-menu.png" file:///tmp/tray-menu.html
+```
+
+Building standalone binaries:
 
 - **macOS:** `make tray-app`, then `open "dist/HITL Tray.app"`. The unsigned
   app may require right-clicking it and choosing **Open** once. `LSUIElement` is
