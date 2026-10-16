@@ -18,6 +18,7 @@ from hitl_queue.notify import (
     StdoutNotifier,
     TeamsNotifier,
     build_notifier,
+    dispatch,
     get_notifier,
 )
 from hitl_queue.queue import Queue
@@ -123,6 +124,55 @@ class NotifyTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(SlackNotifier().notify("x")["ok"])
             self.assertFalse(TeamsNotifier().notify("x")["ok"])
+
+    def test_dispatch_can_be_muted_and_reports_outcome(self):
+        class Unexpected:
+            def notify(self, text, *, source="hitl-queue"):
+                raise AssertionError("muted dispatch must not notify")
+
+        self.assertEqual(
+            dispatch(Unexpected(), "quiet", mute=True),
+            {"channel": "muted", "ok": True, "error": None},
+        )
+        out = dispatch(SlackNotifier(webhook_url=""), "fails", mute=False)
+        self.assertEqual(out["channel"], "slack")
+        self.assertFalse(out["ok"])
+        self.assertIn("error", out)
+
+    def test_queue_honors_mute_environment_when_config_is_unset(self):
+        class Unexpected:
+            def notify(self, text, *, source="hitl-queue"):
+                raise AssertionError("HITL_NOTIFY_MUTE must prevent notification")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"HITL_NOTIFY_MUTE": "true"}, clear=False
+        ):
+            queue = Queue(Path(tmp), config={"notify_progress": False}, notifier=Unexpected())
+            try:
+                self.assertEqual(
+                    queue._notify("quiet", source="test"),
+                    {"channel": "muted", "ok": True, "error": None},
+                )
+            finally:
+                queue.close()
+
+    def test_dispatch_logs_failed_result_and_exception(self):
+        class Failed:
+            def notify(self, text, *, source="hitl-queue"):
+                return {"ok": False, "channel": "test", "error": "delivery failed"}
+
+        class Broken:
+            def notify(self, text, *, source="hitl-queue"):
+                raise RuntimeError("notifier crashed")
+
+        with self.assertLogs("hitl_queue.notify", level="WARNING") as logs:
+            failed = dispatch(Failed(), "one")
+            broken = dispatch(Broken(), "two")
+
+        self.assertFalse(failed["ok"])
+        self.assertFalse(broken["ok"])
+        self.assertIn("delivery failed", logs.output[0])
+        self.assertIn("notifier crashed", logs.output[1])
 
 
 class ReplyServerTests(unittest.TestCase):

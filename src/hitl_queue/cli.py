@@ -52,9 +52,25 @@ def cmd_reply_server(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_app(args: argparse.Namespace) -> int:
+    from .app import launch
+
+    return launch(
+        force_browser=args.browser,
+        port=args.port,
+        apply_opens=args.apply_opens,
+    )
+
+
+def cmd_tray(args: argparse.Namespace) -> int:
+    from .tray import launch
+
+    return launch(state_dir=args.state_dir, demo=args.demo)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="hitl-queue", description=__doc__)
-    p.add_argument("--state-dir", default="state")
+    p.add_argument("--state-dir", dest="global_state_dir", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("demo", help="Run a synthetic end-to-end demo")
@@ -80,6 +96,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8787)
+    s = sub.add_parser(
+        "app",
+        help="Open the demo review board (pywebview window, or browser fallback)",
+    )
+    s.add_argument("--browser", action="store_true", help="Skip pywebview; use the browser")
+    s.add_argument("--port", type=int, default=0, help="Browser fallback port (default: random)")
+    s.add_argument("--apply-opens", default=None, help="Override demo apply_opens (YYYY-MM-DD)")
+    s = sub.add_parser("tray", help="Run the queue tray/menu-bar app")
+    s.add_argument("--demo", action="store_true", help="Use only the neutral synthetic demo data")
+    s.add_argument("--state-dir", default=None, help="Queue state directory")
     s = sub.add_parser("done")
     s.add_argument("id")
     s.add_argument("--actor", default="worker")
@@ -88,10 +114,18 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("id")
 
     args = p.parse_args(argv)
+    if args.cmd == "tray":
+        args.state_dir = args.state_dir or args.global_state_dir
+    else:
+        args.state_dir = args.global_state_dir or "state"
     if args.cmd == "demo":
         return cmd_demo(args)
     if args.cmd == "reply-server":
         return cmd_reply_server(args)
+    if args.cmd == "app":
+        return cmd_app(args)
+    if args.cmd == "tray":
+        return cmd_tray(args)
 
     q = _q(args)
     try:

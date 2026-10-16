@@ -10,13 +10,18 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Matt Reichenbach" }]
-dependencies = []
+dependencies = ["tomli>=1.1.0; python_version < '3.11'"]
 
 [project.optional-dependencies]
 dev = []
+app = ["pywebview>=5"]
+tray = ["pystray>=0.19.5", "Pillow>=10"]
 
 [project.scripts]
 hitl-queue = "hitl_queue.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+hitl_queue = ["app.html"]

@@ -3,8 +3,8 @@
 **Coordinate several coding agents with one human gate.**
 
 Cursor drafts. Claude or Codex applies / ships. You approve from your phone.
-No agent-to-agent chat relay. No shared brain crawl. A durable ticket board
-is the bus.
+Durable tickets remain the work bus; bounded, audited threads are available
+for explicit agent turns.
 
 This is a **public, synthetic** reference for the same playbook used in a
 private operator setup. It ships:
@@ -15,6 +15,7 @@ private operator setup. It ships:
 - reply grammar: `APPROVE TICKET-ID CODEX|CLAUDE` / `SKIP TICKET-ID`
 - optional reply server for Slack slash commands and Teams/Zapier ingress
 - a synthetic end-to-end demo you can run locally
+- durable user/agent threads with run limits, pause/resume/kill, and audit logs
 
 Stdlib Python 3. No cloud required for the queue itself.
 
@@ -77,6 +78,195 @@ SKIP TKT-0001
 Approve while still `new` / `drafting` stores a **preferred worker** and acks.
 When the draft lands in `review`, handoff can use that pick automatically.
 
+## Agent threads
+
+Threads use the same `queue.sqlite3` database. Configure adapters from the
+existing TOML file, then post explicit mentions:
+
+```python
+queue.threads.configure_from("agents.toml")
+thread = queue.threads.create("Release notes", max_agent_runs=6)
+queue.threads.post(thread["id"], "user", "@codex task: summarize the changes")
+queue.threads.post(thread["id"], "user", "@codex fyi: no action needed")
+```
+
+`task:` wakes an active adapter; `fyi:` never does. `pause`, `resume`, and
+`kill` accept an agent name or no name for all agents. Each adapter keeps its
+configured timeout, and the thread run budget bounds agent-to-agent turns.
+
+Every agent entry must set an explicit `work_dir` inside one of its
+`allowed_folders`. The queue state directory must be outside—and must not
+overlap—any agent work folder. This includes symlinks in `work_dir` that point
+at the state directory or one of its ancestors. `allowed_folders` validates
+only the starting directory; the approval gate depends on the invoked agent CLI's own sandbox
+and permission settings to prevent filesystem or network access.
+
+Agent-authored `@name task:` mentions require human approval by default and
+self-tasking is always rejected. Set `allow_agent_to_agent = true` on the
+target agent, or on a thread at creation time, only when that relay is wanted.
+
+Reviewer agents can report `VERDICT: CHANGE`, or a structured
+`REVIEW_VERDICT: {"verdict":"CHANGE","branch":"demo-branch","summary":"...","findings":["..."]}`.
+CHANGE counts are durable per thread and the most recent ticket named by a
+human in that thread (or just the thread when no ticket is named). Escalation
+approval ticket IDs are ignored when deriving that scope, and reviewer-supplied
+branch and ticket fields are display metadata that do not reset the count. At
+`max_review_rounds` (default 3; set under `[threads]` in
+`agents.toml`, or in queue config), automatic `@name task:` handoffs for that
+thread stop if any of its scopes is blocked, and a human approval ticket records
+both positions and open findings. The thread remains blocked until a human
+resolves every blocked scope. `APPROVE TKT-ID CODEX|CLAUDE` resets that scope's
+round count and continues its held handoff (when present); `SKIP TKT-ID` closes
+and resolves that scope without dispatching the held handoff. Resolved and
+skipped scopes no longer block other handoffs. Escalation ticket IDs remain
+recorded after either decision so later human mentions of them cannot become a
+new review scope.
+
+Agents cannot directly request irreversible or outbound work. They emit one
+JSON line, which creates a normal ticket in `review` for the existing
+approve/skip flow:
+
+```text
+ACTION_REQUEST: {"action":"push","summary":"publish the reviewed branch","target":"origin"}
+```
+
+Allowed action names are `push`, `merge`, `send`, and `network`. Messages,
+run start/end results and durations, and approval decisions are copied into
+an append-only `audit_log` table.
+
+### Usage plans and routing
+
+Each completed thread run is also recorded in local SQLite with its start,
+duration, outcome, and adapter-reported token usage. Unknown token counts stay
+unknown. Add an optional plan to an agent in `agents.toml`:
+
+```toml
+[agents.codex.plan]
+window = "5h" # rolling; or "daily" / "weekly" (UTC)
+runs = 40
+minutes = 240
+tokens = 1000000
+warn_threshold = 0.8
+blocked_threshold = 1.0
+```
+
+Caps may be omitted independently. Warnings go through the normal notifier
+(and respect mute), are audited once per threshold/window, and runs stop at
+the blocked threshold. CLI adapters may set `usage_regex` (named token groups
+are supported) or `usage_json_field`; OpenAI-compatible adapters read common
+response usage fields automatically.
+
+```python
+queue.usage.summary()  # per-agent app/read API data
+queue.threads.route("summarize changes", ["codex", "claude"])
+```
+
+The router skips paused, killed, and quota-blocked agents, then chooses the
+greatest remaining quota headroom with agent-name tie breaking.
+
+## Desktop board (demo data)
+
+```bash
+pip install -e ".[app]"          # optional: pywebview window
+python3 -m hitl_queue app        # falls back to your browser without pywebview
+python3 -m hitl_queue app --browser --apply-opens 2026-01-01
+```
+
+The app seeds synthetic tickets into a throwaway state dir (it ignores
+`--state-dir`). It shows one column per status, a collapsed
+blocked/skipped/cancelled lane, ticket files and status history, and the
+`apply_opens` gate. Approve and Skip buttons call `hitl_queue.actions`.
+Notifications go to a local outbox panel with a mute toggle and are never
+sent.
+
+## Desktop app (macOS)
+
+Build the standalone desktop app with the project-local virtualenv:
+
+```bash
+make app
+open "dist/HITL Queue.app"
+```
+
+The build is unsigned. The first time you launch it, right-click
+`HITL Queue.app` and choose **Open** to approve it in macOS.
+
+## Tray app
+
+A menu-bar (macOS) / system-tray (Windows, Linux) icon over the same queue.
+
+![Tray menu with pending approvals, a running agent, and usage bars](docs/images/tray-menu.png)
+
+*Rendered from the tray's real menu model (`TrayModel` in
+`src/hitl_queue/tray.py`) with neutral demo data by
+`scripts/render_tray_menu.py`; submenus are drawn expanded side by side.*
+
+The menu re-reads the queue every 5 seconds and after every action:
+
+| Item | Shows / does |
+|---|---|
+| **Pending approvals** | One submenu per ticket in `review`, labelled `TKT-ID — title` (single line, max 60 chars). Each has **Approve → codex\|claude** — the ticket's preferred worker, else `default_apply_worker`, else `codex` — and **Skip**. Both go through `queue.actions`, the same path as the reply grammar. |
+| **Running agents** | Read-only rows `Agent — THR-ID (status)` for thread runs still `running` or `killing`. |
+| **Usage** | One read-only row per configured agent: a 10-cell bar of its highest used percentage across runs / minutes / tokens, e.g. `Alpha [####------] 40%`, with ` WARN` or ` BLOCKED` at the plan thresholds. |
+| `Error: …` | Appears only when reading state or the last action failed; polling keeps going. |
+| **Open app** | Starts the desktop board (`python3 -m hitl_queue app`, synthetic data) in a separate process. |
+| **Refresh** / **Quit** | Re-read now / stop polling and remove the icon. |
+
+Empty sections show a disabled `None` (or `No usage plans`) row. Agents and
+plans come from `agents.toml` in the working directory, if present.
+
+```bash
+pip install -e ".[tray]"                           # pystray + Pillow
+python3 -m hitl_queue tray                         # state dir: ./state
+python3 -m hitl_queue tray --state-dir path/to/state
+python3 -m hitl_queue --state-dir path/to/state tray   # same; either position works
+python3 -m hitl_queue tray --demo                  # neutral throwaway demo data only
+```
+
+`--demo` ignores `--state-dir` and never touches a real queue. The `tray`
+extra installs `pystray` and `Pillow` (pystray brings in PyObjC on macOS);
+Linux also needs the system packages listed below.
+
+**Default data dir (packaged builds).** Run from source, the tray uses
+`--state-dir` or `./state`. The bundled `HITL Tray` app/executable has no
+working directory to rely on, so it reads `state/` and `agents.toml` from the
+per-user data folder:
+
+| OS | Folder |
+|---|---|
+| macOS | `~/Library/Application Support/HITL Queue/` |
+| Windows | `%APPDATA%\HITL Queue\` |
+| Linux | `$XDG_DATA_HOME/hitl-queue/` (default `~/.local/share/hitl-queue/`) |
+
+An explicit `--state-dir` still wins.
+
+To regenerate the screenshot (no pystray, no window opened):
+
+```bash
+python3 scripts/render_tray_menu.py --output /tmp/tray-menu.html   # prints the path
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless \
+  --hide-scrollbars --window-size=900,240 \
+  --screenshot="$PWD/docs/images/tray-menu.png" file:///tmp/tray-menu.html
+```
+
+Building standalone binaries:
+
+- **macOS:** `make tray-app`, then `open "dist/HITL Tray.app"`. The unsigned
+  app may require right-clicking it and choosing **Open** once. `LSUIElement` is
+  enabled, so the bundle appears only in the menu bar.
+- **Windows:** install the tray extra and run the command above, or build with
+  `pyinstaller --noconfirm --clean packaging/hitl_tray.spec`; launch
+  `dist/HITL Tray/HITL Tray.exe`.
+- **Linux:** install a system tray implementation and GI bindings first. On
+  Debian/Ubuntu: `sudo apt install libappindicator3-dev
+  gir1.2-appindicator3-0.1 python3-gi`. Some desktop environments also require
+  an AppIndicator extension. Build with the same PyInstaller command and launch
+  `dist/HITL Tray`.
+
+The workflow in `.github/workflows/tray-build.yml` builds all three platforms
+and uploads their unsigned artifacts; it can be started manually or by a `v*`
+tag.
+
 ## Optional chat channels
 
 iMessage/Cortland is one option. Slack, Teams, Discord, or any webhook work
@@ -96,7 +286,7 @@ Full setup: [docs/CHANNELS.md](docs/CHANNELS.md).
 
 ## What this is not
 
-- Not a framework that makes agents talk to each other
+- Not an unbounded or unaudited agent chat relay
 - Not an ATS scraper or auto-apply bot for the public demo
 - Not your private second brain, mail, or credentials
 - Not a substitute for reading the ticket before you approve

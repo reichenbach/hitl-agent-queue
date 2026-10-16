@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-from .notify import get_notifier, progress_text
+from .notify import dispatch, get_notifier, progress_text
 
 STATUSES = {
     "new",
@@ -41,6 +42,8 @@ DEFAULT_CONFIG = {
     "apply_opens": "2099-01-01",
     "default_apply_worker": "codex",
     "notify_progress": True,
+    "mute_notifications": False,
+    "max_review_rounds": 3,
     "progress_events": [
         "drafting",
         "approved",
@@ -66,13 +69,15 @@ def apply_gate_open(cfg: dict | None = None, *, today: date | None = None) -> bo
 
 
 class Queue:
-    def __init__(self, state_dir: Path, *, config: dict | None = None, notifier=None):
+    def __init__(self, state_dir: Path, *, config: dict | None = None, notifier=None,
+                 usage_clock=None):
         self.state = Path(state_dir).resolve()
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.cfg = config or dict(DEFAULT_CONFIG)
         self.notifier = notifier or get_notifier()
-        self.db = sqlite3.connect(self.state / "queue.sqlite3", timeout=30, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
+        self._connections = threading.local()
+        self._connections_lock = threading.Lock()
+        self._all_connections: set[sqlite3.Connection] = set()
         self.db.executescript(
             """
             PRAGMA journal_mode=WAL;
@@ -100,8 +105,88 @@ class Queue:
             """
         )
 
+        # Imported lazily to keep the action layer independent of construction.
+        from .actions import Actions
+        from .threads import Threads
+        from .usage import UsageMonitor
+
+        self.actions = Actions(self)
+        self.usage = UsageMonitor(self, **({"clock": usage_clock} if usage_clock else {}))
+        self.threads = Threads(self)
+
+    def audit(
+        self,
+        event: str,
+        *,
+        actor: str,
+        thread_id: str | None = None,
+        message_id: int | None = None,
+        run_id: int | None = None,
+        ticket_id: str | None = None,
+        detail: dict | None = None,
+    ) -> None:
+        """Append one immutable audit record."""
+        self.db.execute(
+            "INSERT INTO audit_log(event,actor,thread_id,message_id,run_id,ticket_id,detail,at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                event,
+                actor,
+                thread_id,
+                message_id,
+                run_id,
+                ticket_id,
+                json.dumps(detail or {}, sort_keys=True),
+                time.time(),
+            ),
+        )
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        """Return this thread's connection; Queue instances can be shared safely."""
+        connection = getattr(self._connections, "db", None)
+        with self._connections_lock:
+            if connection not in self._all_connections:
+                connection = sqlite3.connect(
+                    self.state / "queue.sqlite3",
+                    timeout=30,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA recursive_triggers=ON")
+                self._connections.db = connection
+                self._all_connections.add(connection)
+        return connection
+
     def close(self) -> None:
-        self.db.close()
+        with self._connections_lock:
+            connections = tuple(self._all_connections)
+            self._all_connections.clear()
+        for connection in connections:
+            connection.close()
+        if hasattr(self._connections, "db"):
+            del self._connections.db
+
+    def close_thread(self) -> None:
+        """Close only the calling thread's connection; other threads keep theirs."""
+        connection = getattr(self._connections, "db", None)
+        if connection is None:
+            return
+        del self._connections.db
+        with self._connections_lock:
+            owned = connection in self._all_connections
+            self._all_connections.discard(connection)
+        if owned:
+            connection.close()
+
+    def _notify(self, text: str, *, source: str) -> dict:
+        return dispatch(
+            self.notifier,
+            text,
+            source=source,
+            mute=self.cfg.get("mute_notifications"),
+        )
 
     def transaction(self, fn):
         self.db.execute("BEGIN IMMEDIATE")
@@ -147,12 +232,35 @@ class Queue:
         sql += " ORDER BY created"
         return [dict(r) for r in self.db.execute(sql, args)]
 
+    def history(self, tid: str) -> list[dict]:
+        """Return a ticket's status events in chronological order."""
+        self.get(tid)  # Give callers the same unknown-ticket error as other helpers.
+        rows = self.db.execute(
+            "SELECT seq,ticket_id,status,actor,note,at FROM events "
+            "WHERE ticket_id=? ORDER BY seq",
+            (tid,),
+        )
+        return [dict(row) for row in rows]
+
+    status_history = history
+
+    def count_by_status(self) -> dict[str, int]:
+        """Count all tickets, including terminal tickets, grouped by status."""
+        counts = {status: 0 for status in STATUSES}
+        for row in self.db.execute(
+            "SELECT status, COUNT(*) AS count FROM tickets GROUP BY status"
+        ):
+            counts[row["status"]] = row["count"]
+        return counts
+
+    status_counts = count_by_status
+
     def _ping(self, ticket: dict, status: str, detail: str = "") -> None:
         if not self.cfg.get("notify_progress", True):
             return
         if status not in (self.cfg.get("progress_events") or []):
             return
-        self.notifier.notify(
+        self._notify(
             progress_text(ticket, status, detail=detail),
             source="hitl-progress",
         )
@@ -196,7 +304,7 @@ class Queue:
             return self.get(tid)
 
         ticket = self.transaction(action)
-        self.notifier.notify(
+        self._notify(
             f"New {ticket['id']}\n{ticket.get('company') or ''} - {ticket['title']}\n"
             f"Queued for draft.\nSkip: SKIP {ticket['id']}",
             source="hitl-new",
@@ -281,7 +389,7 @@ class Queue:
             )
 
         ticket = self.transaction(action)
-        self.notifier.notify(
+        self._notify(
             f"{tid} ready\n{ticket.get('company') or ''} - {ticket['title']}\n"
             f"Reply:\nAPPROVE {tid} CODEX\nAPPROVE {tid} CLAUDE\nSKIP {tid}",
             source="hitl-review",
@@ -294,7 +402,12 @@ class Queue:
 
     def approve(self, tid: str, *, actor: str = "human", note: str = "") -> dict:
         def action():
-            return self._set(tid, "approved", actor, note or "approved")
+            ticket = self._set(tid, "approved", actor, note or "approved")
+            self.audit(
+                "approval", actor=actor, ticket_id=tid,
+                detail={"decision": "approve", "note": note or "approved"},
+            )
+            return ticket
 
         ticket = self.transaction(action)
         self._ping(ticket, "approved", detail=note or actor)
@@ -302,7 +415,18 @@ class Queue:
 
     def skip(self, tid: str, *, actor: str = "human", note: str = "") -> dict:
         def action():
-            return self._set(tid, "skipped", actor, note or "skipped")
+            before = self.get(tid)
+            ticket = self._set(tid, "skipped", actor, note or "skipped")
+            self.audit(
+                "approval", actor=actor, ticket_id=tid,
+                detail={"decision": "skip", "note": note or "skipped"},
+            )
+            review_cap = (before.get("payload") or {}).get("review_round_cap")
+            if review_cap:
+                self.threads.resolve_review_scope(
+                    review_cap["thread_id"], review_cap["scope"], tid
+                )
+            return ticket
 
         ticket = self.transaction(action)
         self._ping(ticket, "skipped", detail=note or actor)
@@ -322,6 +446,10 @@ class Queue:
                 (json.dumps(payload, sort_keys=True), time.time(), tid),
             )
             self._event(tid, job["status"], "human", f"preferred_worker={worker}")
+            self.audit(
+                "approval", actor="human", ticket_id=tid,
+                detail={"decision": "prefer_worker", "worker": worker},
+            )
             return self.get(tid)
 
         return self.transaction(action)
@@ -395,32 +523,11 @@ class Queue:
         )
         if m:
             tid, worker = m.group(2).upper(), m.group(3).lower()
-            ticket = self.get(tid)
-            if ticket["status"] in {"new", "drafting"}:
-                self.set_preferred_worker(tid, worker)
-                self.notifier.notify(
-                    f"Got it. {tid} → {worker} after draft. Reply SKIP {tid} to cancel.",
-                    source="hitl-reply",
-                )
-                return {"ok": True, "action": "prefer_worker", "id": tid, "worker": worker}
-            if ticket["status"] == "review":
-                self.approve(tid, actor="human", note=f"APPROVE → {worker}")
-            elif ticket["status"] != "approved":
-                self.notifier.notify(
-                    f"{tid} is {ticket['status']}; cannot approve.",
-                    source="hitl-reply",
-                )
-                return {"ok": False, "error": f"status {ticket['status']}"}
-            mode = "apply" if apply_gate_open(self.cfg) else "review_only"
-            self.handoff(tid, to=worker, actor="human", mode=mode)
-            self.notifier.notify(f"OK {tid} → {worker} ({mode})", source="hitl-reply")
-            return {"ok": True, "action": "handoff", "id": tid, "worker": worker, "mode": mode}
+            return self.actions.approve(tid, worker)
 
         m = re.match(r"^\s*(SKIP|DENY|NO)\s+(TKT-\d+)\s*$", line, re.I)
         if m:
             tid = m.group(2).upper()
-            self.skip(tid, actor="human", note="SKIP via reply")
-            self.notifier.notify(f"Skipped {tid}", source="hitl-reply")
-            return {"ok": True, "action": "skip", "id": tid}
+            return self.actions.skip(tid)
 
         return {"ok": False, "error": "unparsed"}
