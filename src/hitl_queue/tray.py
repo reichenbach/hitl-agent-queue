@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .paths import user_data_dir
 from .queue import Queue
 from .text import sanitize_summary
 
@@ -39,11 +40,14 @@ class TrayModel:
         self,
         queue: Queue,
         *,
+        demo: bool = False,
         app_launcher: Callable[[], object] | None = None,
         on_change: Callable[[], object] | None = None,
     ) -> None:
         self.queue = queue
-        self.app_launcher = app_launcher or launch_desktop_app
+        self.app_launcher = app_launcher or (
+            lambda: launch_desktop_app(state_dir=self.queue.state, demo=demo)
+        )
         self.on_change = on_change
         self._lock = threading.RLock()
         self._refresh_error: str | None = None
@@ -181,11 +185,15 @@ def usage_bar(percent: float, width: int = 10) -> str:
     return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
-def launch_desktop_app() -> subprocess.Popen:
+def launch_desktop_app(*, state_dir: str | Path | None = None, demo: bool = False) -> subprocess.Popen:
     """Open the existing desktop app in a separate process."""
     command = [sys.executable, "app"] if getattr(sys, "frozen", False) else [
         sys.executable, "-m", "hitl_queue", "app"
     ]
+    if state_dir is not None:
+        command.extend(("--state-dir", str(state_dir)))
+    if demo:
+        command.append("--demo")
     return subprocess.Popen(command)
 
 
@@ -306,19 +314,6 @@ def schedule_on_main_thread(callback: Callable[[], None]) -> object:
     return callback()
 
 
-def user_data_dir() -> Path:
-    """Return the platform's conventional per-user application data directory."""
-    import os
-
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "HITL Queue"
-    if sys.platform == "win32":
-        base = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
-        return Path(base) / "HITL Queue"
-    base = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
-    return Path(base) / "hitl-queue"
-
-
 def launch(*, state_dir: str | Path | None = None, demo: bool = False) -> int:
     """Run the tray against public state, or existing synthetic demo data."""
     temporary = tempfile.TemporaryDirectory(prefix="hitl-tray-demo-") if demo else None
@@ -338,7 +333,7 @@ def launch(*, state_dir: str | Path | None = None, demo: bool = False) -> int:
             queue.threads.configure_from(agents_file)
     application = None
     try:
-        application = TrayApplication(TrayModel(queue))
+        application = TrayApplication(TrayModel(queue, demo=demo))
         application.run()
         return 0
     finally:

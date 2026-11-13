@@ -1,30 +1,38 @@
-"""Desktop review board for the HITL queue (synthetic demo data only).
+"""Desktop review board for a real HITL queue, with an opt-in synthetic demo.
 
 ``python3 -m hitl_queue app`` opens the board in a pywebview window when the
 optional ``pywebview`` dependency is installed (``pip install -e ".[app]"``),
 otherwise in the default browser via a localhost-only HTTP server.
 
-The app always runs against a throwaway state directory seeded with demo
-tickets. Buttons call ``Queue.actions``; notifications land in an in-memory
-outbox shown in the UI and are never sent anywhere.
+The app opens ``--state-dir`` or ``./state`` when run from source. Packaged
+builds default to ``state/`` in the shared per-user data directory. Real mode
+loads ``agents.toml`` from the working directory (the per-user data directory
+in packaged builds) and never seeds tickets. ``--demo`` instead uses a throwaway
+directory seeded with synthetic tickets and allows ``--apply-opens`` overrides.
+Buttons call ``Queue.actions``; notifications land in an in-memory outbox
+shown in the UI and are never sent anywhere in either mode.
 """
 
 from __future__ import annotations
 
 import functools
+import html
 import json
 import logging
 import os
 import secrets
+import sys
 import tempfile
 import threading
 import time
 import webbrowser
 from collections import deque
+from contextlib import nullcontext
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .paths import user_data_dir
 from .queue import DEFAULT_CONFIG, TRANSITIONS, Queue, apply_gate_open
 
 BOARD_STATUSES = ["new", "drafting", "review", "approved", "handoff", "done"]
@@ -171,8 +179,9 @@ class AppApi:
     Attributes are underscore-prefixed so pywebview does not expose them.
     """
 
-    def __init__(self, queue: OutboxQueue):
+    def __init__(self, queue: OutboxQueue, *, demo: bool = False):
         self._queue = queue
+        self._title = f"HITL Queue — {'demo data' if demo else queue.state}"
 
     @staticmethod
     def _controls(status: str) -> dict:
@@ -231,7 +240,7 @@ class AppApi:
         info = {"label": label, "path": str(raw), "exists": False, "size": None, "preview": None}
         path = Path(raw).resolve()
         if not path.is_relative_to(self._queue.state):
-            info["note"] = "outside the demo state dir; not read"
+            info["note"] = "outside the state dir; not read"
             return info
         if not path.is_file():
             return info
@@ -310,9 +319,11 @@ for _name, _method in vars(AppApi).items():
 del _name, _method
 
 
-def render_page(transport: str, token: str = "") -> str:
+def render_page(transport: str, token: str = "", *, title: str = "HITL Queue") -> str:
     boot = json.dumps({"transport": transport, "token": token})
-    return PAGE.read_text(encoding="utf-8").replace("/*__HITL_BOOT__*/null", boot)
+    return PAGE.read_text(encoding="utf-8").replace(
+        "/*__HITL_BOOT__*/null", boot
+    ).replace("__HITL_TITLE__", html.escape(title))
 
 
 def make_http_handler(api: AppApi, token: str, page: str):
@@ -388,7 +399,7 @@ def make_http_handler(api: AppApi, token: str, page: str):
 
 def make_server(api: AppApi, *, port: int = 0) -> ThreadingHTTPServer:
     token = secrets.token_urlsafe(24)
-    handler = make_http_handler(api, token, render_page("http", token))
+    handler = make_http_handler(api, token, render_page("http", token, title=api._title))
     return ThreadingHTTPServer(("127.0.0.1", port), handler)
 
 
@@ -406,8 +417,8 @@ def _load_webview():
 
 def _run_webview(webview, api: AppApi, opened: threading.Event) -> None:
     window = webview.create_window(
-        "HITL queue - demo board",
-        html=render_page("pywebview"),
+        api._title,
+        html=render_page("pywebview", title=api._title),
         js_api=api,
         width=1440,
         height=900,
@@ -420,7 +431,7 @@ def _run_webview(webview, api: AppApi, opened: threading.Event) -> None:
 def _run_browser(api: AppApi, *, port: int = 0, open_browser: bool = True) -> int:
     httpd = make_server(api, port=port)
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
-    print(f"HITL demo board at {url}  (Ctrl-C to quit)")
+    print(f"{api._title} at {url}  (Ctrl-C to quit)")
     if open_browser:
         webbrowser.open(url)
     try:
@@ -434,21 +445,37 @@ def _run_browser(api: AppApi, *, port: int = 0, open_browser: bool = True) -> in
 
 def launch(
     *,
+    state_dir: str | Path | None = None,
+    demo: bool = False,
     force_browser: bool = False,
     port: int = 0,
     apply_opens: str | None = None,
     open_browser: bool = True,
 ) -> int:
-    config = demo_config(apply_opens)
-    with tempfile.TemporaryDirectory(prefix="hitl-app-demo-") as tmp:
-        queue = OutboxQueue(Path(tmp), config=config)
+    if apply_opens is not None and not demo:
+        raise ValueError("--apply-opens requires --demo")
+    frozen_dir = user_data_dir() if getattr(sys, "frozen", False) else None
+    resolved_state = Path(state_dir) if state_dir is not None else (
+        frozen_dir / "state" if frozen_dir else Path("state")
+    )
+    temporary = tempfile.TemporaryDirectory(prefix="hitl-app-demo-") if demo else nullcontext()
+    with temporary as tmp:
+        if demo:
+            queue = OutboxQueue(Path(tmp), config=demo_config(apply_opens))
+        else:
+            queue = OutboxQueue(resolved_state)
         try:
-            seed_demo(queue)
+            if demo:
+                seed_demo(queue)
+            else:
+                agents_file = frozen_dir / "agents.toml" if frozen_dir else Path("agents.toml")
+                if agents_file.is_file():
+                    queue.threads.configure_from(agents_file)
             webview = None if force_browser else _load_webview()
             if webview is not None:
                 opened = threading.Event()
                 try:
-                    _run_webview(webview, WebviewApi(queue), opened)
+                    _run_webview(webview, WebviewApi(queue, demo=demo), opened)
                     return 0
                 except Exception as exc:
                     if opened.is_set():
@@ -456,6 +483,6 @@ def launch(
                         return 1
                     log.exception("pywebview could not start")
                     print(f"pywebview could not start ({exc}); opening in your browser instead.")
-            return _run_browser(AppApi(queue), port=port, open_browser=open_browser)
+            return _run_browser(AppApi(queue, demo=demo), port=port, open_browser=open_browser)
         finally:
             queue.close()

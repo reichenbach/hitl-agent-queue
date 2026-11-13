@@ -40,7 +40,7 @@ class _DemoCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.queue = OutboxQueue(Path(self.tmp.name), config=demo_config(self.apply_opens))
         seed_demo(self.queue)
-        self.api = AppApi(self.queue)
+        self.api = AppApi(self.queue, demo=True)
 
     def tearDown(self):
         self.queue.close()
@@ -94,6 +94,17 @@ class AppApiTests(_DemoCase):
             outside.write_text("private", encoding="utf-8")
             info = self.api._file_info("artifact", str(outside))
         self.assertFalse(info["exists"])
+        self.assertIsNone(info["preview"])
+        self.assertIn("not read", info["note"])
+        self.assertNotIn("demo", info["note"])
+
+    def test_symlinks_outside_state_dir_are_not_read(self):
+        with tempfile.TemporaryDirectory() as other:
+            outside = Path(other) / "artifact.txt"
+            outside.write_text("outside content", encoding="utf-8")
+            link = self.queue.state / "linked-artifact.txt"
+            link.symlink_to(outside)
+            info = self.api._file_info("artifact", str(link))
         self.assertIsNone(info["preview"])
         self.assertIn("not read", info["note"])
 
@@ -193,6 +204,7 @@ class HttpFallbackTests(_DemoCase):
         self.thread.start()
         page = self._get("/")
         self.assertIn('"transport": "http"', page)
+        self.assertIn("<title>HITL Queue — demo data</title>", page)
         self.token = re.search(r'"token": "([^"]+)"', page).group(1)
 
     def tearDown(self):
@@ -318,6 +330,7 @@ def _fake_webview(start=None):
 
 class LauncherTests(unittest.TestCase):
     def _launch(self, webview_module, expect=0, **kwargs):
+        kwargs.setdefault("demo", True)
         with mock.patch.dict(sys.modules, {"webview": webview_module}), mock.patch.object(
             app, "_run_browser", return_value=0
         ) as run_browser, redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
@@ -335,6 +348,8 @@ class LauncherTests(unittest.TestCase):
         run_browser, _ = self._launch(fake)
         run_browser.assert_not_called()
         kwargs = fake.create_window.call_args.kwargs
+        self.assertEqual(fake.create_window.call_args.args[0], "HITL Queue — demo data")
+        self.assertIn("HITL Queue — demo data", kwargs["html"])
         self.assertIsInstance(kwargs["js_api"], WebviewApi)
         self.assertIn('"transport": "pywebview"', kwargs["html"])
         fake.start.assert_called_once()
@@ -370,8 +385,132 @@ class LauncherTests(unittest.TestCase):
 
     def test_cli_app_subcommand(self):
         with mock.patch.object(app, "launch", return_value=0) as launch:
-            self.assertEqual(main(["app", "--browser", "--apply-opens", "2026-01-01"]), 0)
-        launch.assert_called_once_with(force_browser=True, port=0, apply_opens="2026-01-01")
+            self.assertEqual(main(["app", "--demo", "--browser", "--apply-opens", "2026-01-01"]), 0)
+        launch.assert_called_once_with(
+            state_dir=None, demo=True, force_browser=True, port=0, apply_opens="2026-01-01"
+        )
+
+    def test_cli_app_state_dir_in_either_position(self):
+        for argv, expected in [
+            (["app"], None),
+            (["--state-dir", "queue-state", "app"], "queue-state"),
+            (["app", "--state-dir", "queue-state"], "queue-state"),
+            (["--state-dir", "global", "app", "--state-dir", "local"], "local"),
+        ]:
+            with self.subTest(argv=argv), mock.patch.object(app, "launch", return_value=0) as launch:
+                self.assertEqual(main(argv), 0)
+                launch.assert_called_once_with(
+                    state_dir=expected, demo=False, force_browser=False, port=0, apply_opens=None
+                )
+
+    def test_cli_apply_opens_requires_demo(self):
+        with mock.patch.object(app, "launch") as launch, redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as raised:
+                main(["app", "--apply-opens", "2026-01-01"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--apply-opens requires --demo", err.getvalue())
+        launch.assert_not_called()
+
+
+class RealAppTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.old_cwd = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(os.chdir, self.old_cwd)
+
+    def test_real_mode_shows_existing_tickets_without_seeding(self):
+        state = self.root / "queue-state"
+        queue = OutboxQueue(state)
+        try:
+            ticket = queue.enqueue(title="Existing checklist")
+        finally:
+            queue.close()
+
+        def check_board(api, **kwargs):
+            cards = [t for col in api.board()["columns"] for t in col["tickets"]]
+            self.assertEqual([t["id"] for t in cards], [ticket["id"]])
+            self.assertEqual(cards[0]["title"], "Existing checklist")
+            self.assertEqual(api._title, f"HITL Queue — {state}")
+            return 0
+
+        with mock.patch.object(app, "seed_demo") as seed, \
+                mock.patch.object(app, "demo_config") as config, \
+                mock.patch.object(app, "_run_browser", side_effect=check_board):
+            self.assertEqual(app.launch(state_dir=state, force_browser=True), 0)
+        seed.assert_not_called()
+        config.assert_not_called()
+        queue = OutboxQueue(state)
+        try:
+            self.assertEqual(len(queue.list(include_terminal=True)), 1)
+        finally:
+            queue.close()
+
+    def test_source_and_frozen_defaults_and_config(self):
+        for frozen, explicit in [(False, False), (False, True), (True, False), (True, True)]:
+            with self.subTest(frozen=frozen, explicit=explicit):
+                data_dir = self.root / "user-data"
+                data_dir.mkdir(exist_ok=True)
+                config_dir = data_dir if frozen else self.root
+                (config_dir / "work").mkdir(exist_ok=True)
+                (config_dir / "agents.toml").write_text(
+                    "[threads]\nmax_review_rounds = 5\n"
+                    "[agents.worker]\ntype = 'fake'\nallowed_folders = ['work']\n"
+                    "work_dir = 'work'\nmax_turns = 1\ntimeout_seconds = 1\n"
+                    "[agents.worker.plan]\nwindow = 'daily'\nruns = 10\n",
+                    encoding="utf-8",
+                )
+                state = self.root / "explicit-state" if explicit else config_dir / "state"
+
+                def check_board(api, **kwargs):
+                    self.assertEqual(api._queue.state, state)
+                    self.assertEqual(api._queue.cfg["max_review_rounds"], 5)
+                    self.assertEqual(api.usage()[0]["agent"], "worker")
+                    self.assertFalse(any(c["tickets"] for c in api.board()["columns"]))
+                    return 0
+
+                with mock.patch.object(sys, "frozen", frozen, create=True), \
+                        mock.patch.object(app, "user_data_dir", return_value=data_dir), \
+                        mock.patch.object(app, "seed_demo") as seed, \
+                        mock.patch.object(app, "_run_browser", side_effect=check_board):
+                    self.assertEqual(app.launch(
+                        state_dir=state if explicit else None, force_browser=True
+                    ), 0)
+                seed.assert_not_called()
+
+    def test_demo_ignores_state_dir_and_cleans_up(self):
+        real_state = self.root / "untouched-state"
+        demo_states = []
+
+        def check_board(api, **kwargs):
+            demo_states.append(api._queue.state)
+            self.assertNotEqual(api._queue.state, real_state)
+            self.assertTrue(all(c["tickets"] for c in api.board()["columns"]))
+            self.assertEqual(api.gate()["apply_opens"], "2000-01-01")
+            self.assertEqual(api._title, "HITL Queue — demo data")
+            return 0
+
+        with mock.patch.object(app, "_run_browser", side_effect=check_board):
+            self.assertEqual(app.launch(
+                state_dir=real_state, demo=True, force_browser=True, apply_opens="2000-01-01"
+            ), 0)
+        self.assertFalse(real_state.exists())
+        self.assertFalse(demo_states[0].exists())
+
+    def test_real_window_and_http_page_show_state_path_safely(self):
+        state = self.root / "queue <example> & data"
+        fake = _fake_webview()
+        with mock.patch.object(app, "_load_webview", return_value=fake):
+            self.assertEqual(app.launch(state_dir=state), 0)
+        self.assertEqual(fake.create_window.call_args.args[0], f"HITL Queue — {state}")
+        self.assertIn("queue &lt;example&gt; &amp; data", fake.create_window.call_args.kwargs["html"])
+        queue = OutboxQueue(state)
+        self.addCleanup(queue.close)
+        self.assertIn(
+            "queue &lt;example&gt; &amp; data", app.render_page("http", title=AppApi(queue)._title)
+        )
 
 
 if __name__ == "__main__":

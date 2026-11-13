@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HITL queue - demo board</title>
+<title>__HITL_TITLE__</title>
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --card: #1e222b; --line: #2a2f3a;
@@ -73,7 +73,7 @@
 <body>
 <header>
   <h1>HITL agent queue</h1>
-  <span class="sub">Demo board &middot; synthetic data in a throwaway state dir</span>
+  <span class="sub">__HITL_TITLE__</span>
 </header>
 <div id="gate">Loading apply gate&hellip;</div>
 <main>
@@ -235,8 +235,8 @@ function renderNotifier(n) {
   document.getElementById("notifier").replaceChildren(
     el("h3", { text: "Notifier" }),
     el("dl", { class: "meta" }, [
-      el("dt", { text: "Channel" }), el("dd", { text: "local outbox (demo, never sends)" }),
-      el("dt", { text: "HITL_NOTIFY" }), el("dd", { text: `${n.configured} (ignored in demo)` }),
+      el("dt", { text: "Channel" }), el("dd", { text: "local outbox (never sends)" }),
+      el("dt", { text: "HITL_NOTIFY" }), el("dd", { text: `${n.configured} (ignored by board)` }),
       el("dt", { text: "State" }), el("dd", { text: n.muted ? "muted" : "live (to outbox)" }),
     ]),
     el("label", { class: "toggle" }, [toggle, el("span", { text: "Mute notifications" })]),
