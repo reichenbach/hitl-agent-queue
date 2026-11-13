@@ -186,27 +186,34 @@ blocked/skipped/cancelled lane, ticket files and status history, and the
 Notifications go to a local outbox panel with a mute toggle and are never
 sent in either mode. File previews only read files inside the state dir.
 
-## Desktop app (macOS)
+## Desktop application bundle
 
-Build the standalone desktop app with the project-local virtualenv:
+Build the board and tray together with the project-local virtualenv. This
+installs both extras and PyInstaller into `.venv`:
 
 ```bash
-make app
+make bundle
 open "dist/HITL Queue.app"
 ```
 
-The packaged app opens the real queue in
-`~/Library/Application Support/HITL Queue/state/` by default, sharing it with
-the packaged tray app. It loads `agents.toml` from the same parent data folder.
-To select another queue or open a throwaway demo:
+Launching **HITL Queue** starts the tray. Its **Open app** command opens the
+board from the same bundled executable with the tray's state directory.
+On macOS, the default queue is
+`~/Library/Application Support/HITL Queue/state/`; `agents.toml` loads from
+the same parent data folder. To select another queue, start a demo tray, or
+open the board directly:
 
 ```bash
 open "dist/HITL Queue.app" --args --state-dir path/to/state
 open "dist/HITL Queue.app" --args --demo
+"dist/HITL Queue.app/Contents/MacOS/HITL Queue" app --state-dir path/to/state
 ```
 
 The build is unsigned. The first time you launch it, right-click
 `HITL Queue.app` and choose **Open** to approve it in macOS.
+
+The legacy `make app` (board only) and `make tray-app` (tray only) targets
+remain available. Use `make bundle` for the combined application.
 
 ## Tray app
 
@@ -245,7 +252,7 @@ extra installs `pystray` and `Pillow` (pystray brings in PyObjC on macOS);
 Linux also needs the system packages listed below.
 
 **Default data dir (packaged builds).** Run from source, the tray uses
-`--state-dir` or `./state`. The bundled `HITL Tray` app/executable has no
+`--state-dir` or `./state`. The bundled `HITL Queue` app/executable has no
 working directory to rely on, so it reads `state/` and `agents.toml` from the
 per-user data folder:
 
@@ -266,23 +273,24 @@ python3 scripts/render_tray_menu.py --output /tmp/tray-menu.html   # prints the 
   --screenshot="$PWD/docs/images/tray-menu.png" file:///tmp/tray-menu.html
 ```
 
-Building standalone binaries:
+Building the single application bundle:
 
-- **macOS:** `make tray-app`, then `open "dist/HITL Tray.app"`. The unsigned
+- **macOS:** `make bundle`, then `open "dist/HITL Queue.app"`. The unsigned
   app may require right-clicking it and choosing **Open** once. `LSUIElement` is
   enabled, so the bundle appears only in the menu bar.
-- **Windows:** install the tray extra and run the command above, or build with
-  `pyinstaller --noconfirm --clean packaging/hitl_tray.spec`; launch
-  `dist/HITL Tray/HITL Tray.exe`.
+- **Windows:** install `.[app,tray]` and `pyinstaller`, then build with
+  `pyinstaller --noconfirm --clean packaging/hitl.spec`; launch
+  `dist/HITL Queue/HITL Queue.exe`. Pass `app --state-dir path/to/state`
+  to open the board directly.
 - **Linux:** install a system tray implementation and GI bindings first. On
   Debian/Ubuntu: `sudo apt install libappindicator3-dev
   gir1.2-appindicator3-0.1 python3-gi`. Some desktop environments also require
-  an AppIndicator extension. Build with the same PyInstaller command and launch
-  `dist/HITL Tray`.
+  an AppIndicator extension. Install `.[app,tray]` and `pyinstaller`, build with
+  the same PyInstaller command, and launch `dist/HITL Queue/HITL Queue`.
 
-The workflow in `.github/workflows/tray-build.yml` builds all three platforms
-and uploads their unsigned artifacts; it can be started manually or by a `v*`
-tag.
+The workflow in `.github/workflows/tray-build.yml` builds the combined bundle
+on all three platforms and uploads unsigned artifacts; it can be started
+manually or by a `v*` tag. It does not publish a release.
 
 ## Optional chat channels
 

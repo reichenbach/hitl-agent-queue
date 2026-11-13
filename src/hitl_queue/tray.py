@@ -186,7 +186,7 @@ def usage_bar(percent: float, width: int = 10) -> str:
 
 
 def launch_desktop_app(*, state_dir: str | Path | None = None, demo: bool = False) -> subprocess.Popen:
-    """Open the existing desktop app in a separate process."""
+    """Open the board via this frozen executable, or via Python from source."""
     command = [sys.executable, "app"] if getattr(sys, "frozen", False) else [
         sys.executable, "-m", "hitl_queue", "app"
     ]

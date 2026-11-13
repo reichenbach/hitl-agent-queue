@@ -1,4 +1,4 @@
-name: Tray builds
+name: Desktop bundle builds
 
 on:
   workflow_dispatch:
@@ -24,23 +24,23 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libappindicator3-dev gir1.2-appindicator3-0.1 python3-gi
       - name: Install build dependencies
-        run: python -m pip install -e ".[tray]" pyinstaller
+        run: python -m pip install -e ".[app,tray]" pyinstaller
       - name: Build
-        run: pyinstaller --noconfirm --clean packaging/hitl_tray.spec
+        run: pyinstaller --noconfirm --clean packaging/hitl.spec
       - name: Package macOS app
         if: runner.os == 'macOS'
-        run: ditto -c -k --keepParent "dist/HITL Tray.app" hitl-tray-macOS.zip
+        run: ditto -c -k --keepParent "dist/HITL Queue.app" hitl-queue-macOS.zip
       - name: Package Windows app
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path "dist/HITL Tray" -DestinationPath hitl-tray-Windows.zip
+        run: Compress-Archive -Path "dist/HITL Queue" -DestinationPath hitl-queue-Windows.zip
       - name: Package Linux app
         if: runner.os == 'Linux'
-        run: tar -czf hitl-tray-Linux.tar.gz -C dist "HITL Tray"
+        run: tar -czf hitl-queue-Linux.tar.gz -C dist "HITL Queue"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: hitl-tray-${{ runner.os }}
+          name: hitl-queue-${{ runner.os }}
           path: |
-            hitl-tray-*.zip
-            hitl-tray-*.tar.gz
+            hitl-queue-*.zip
+            hitl-queue-*.tar.gz
           if-no-files-found: error
