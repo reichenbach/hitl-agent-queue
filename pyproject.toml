@@ -24,4 +24,4 @@ hitl-queue = "hitl_queue.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-hitl_queue = ["app.html"]
+hitl_queue = ["app.html", "agents.example.toml"]

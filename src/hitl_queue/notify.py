@@ -244,6 +244,25 @@ _BUILDERS = {
     "webhook": lambda: GenericWebhookNotifier(),
 }
 
+NOTIFIER_ENV = {
+    "stdout": None,
+    "cortland": "CORTLAND_IMESSAGE_CLI",
+    "slack": "HITL_SLACK_WEBHOOK_URL",
+    "teams": "HITL_TEAMS_WEBHOOK_URL",
+    "discord": "HITL_DISCORD_WEBHOOK_URL",
+    "webhook": "HITL_WEBHOOK_URL",
+}
+
+
+def notifier_name(state_dir: str | Path | None = None) -> str:
+    """Explicit environment selection wins over the saved first-run choice."""
+    mode = os.environ.get("HITL_NOTIFY")
+    if not mode and state_dir is not None:
+        settings = Path(state_dir) / "settings.json"
+        if settings.is_file():
+            mode = json.loads(settings.read_text(encoding="utf-8")).get("notifier")
+    return (mode or "stdout").lower().strip()
+
 
 def build_notifier(name: str):
     key = name.strip().lower()
@@ -254,13 +273,13 @@ def build_notifier(name: str):
     return _BUILDERS[key]()
 
 
-def get_notifier():
+def get_notifier(state_dir: str | Path | None = None):
     """
     HITL_NOTIFY selects the channel:
       stdout (default) | cortland | slack | teams | discord | webhook
       multi  → HITL_NOTIFY_CHANNELS=stdout,slack,teams
     """
-    mode = (os.environ.get("HITL_NOTIFY") or "stdout").lower().strip()
+    mode = notifier_name(state_dir)
     if mode == "multi":
         names = [
             n.strip()

@@ -177,7 +177,9 @@ python3 -m hitl_queue app --demo --browser --apply-opens 2026-01-01
 
 By default, the board opens the real queue at `--state-dir` or `./state`
 when run from source, without adding demo tickets. Agents and plans load from
-`agents.toml` in the working directory, if present. `--demo` opts into synthetic
+`agents.toml` in the state directory; the working-directory file is a legacy
+fallback. If the state directory has no `agents.toml`, a first-run panel lets
+you pick agents and a notifier before showing the board. `--demo` opts into synthetic
 tickets in a throwaway state dir and ignores `--state-dir`; `--apply-opens`
 is only accepted with `--demo`. The window title and page identify the state
 path or demo mode. The board shows one column per status, a collapsed
@@ -198,9 +200,41 @@ open "dist/HITL Queue.app"
 
 Launching **HITL Queue** starts the tray. Its **Open app** command opens the
 board from the same bundled executable with the tray's state directory.
+On first launch, choose **Finish setup...** in the tray, pick agents and a
+notifier in the board, then **Save**. Choices come from the bundled example
+(currently Claude, Codex, generic CLI, and a local model). Install and sign in
+to your chosen CLIs or start your local model server separately.
+
 On macOS, the default queue is
-`~/Library/Application Support/HITL Queue/state/`; `agents.toml` loads from
-the same parent data folder. To select another queue, start a demo tray, or
+`~/Library/Application Support/HITL Queue/state/`; setup saves `agents.toml`
+and `settings.json` there. Workspaces are created in the sibling
+`state-workspaces/` folder so agents' working directories do not overlap queue
+state. Paths in `agents.toml` stay relative to that file. Existing configuration
+files are never overwritten, including on repeated setup runs. A legacy
+`agents.toml` in the parent data folder remains a fallback.
+
+For non-interactive setup (no file editing required):
+
+```bash
+python3 -m hitl_queue setup --state-dir path/to/state --agents claude,codex --notifier stdout
+python3 -m hitl_queue setup --state-dir path/to/state --force-check
+```
+
+`--agents` defaults to all example agents; `--notifier` defaults to `stdout`.
+`--force-check` only reports status and available choices, without creating files.
+`--state-dir` works before or after `setup`; its default matches the board and
+tray (`./state` from source, per-user `state/` in the bundle).
+
+Notifier choices are `stdout`, `slack`, `teams`, `discord`, `webhook`, and
+`cortland`. Settings save only the channel and environment variable name,
+never webhook URLs or API keys. Before launching the app, supply the relevant
+variable in its environment: `HITL_SLACK_WEBHOOK_URL`, `HITL_TEAMS_WEBHOOK_URL`,
+`HITL_DISCORD_WEBHOOK_URL`, `HITL_WEBHOOK_URL`, or `CORTLAND_IMESSAGE_CLI`.
+`stdout` requires none. `HITL_NOTIFY` overrides the saved channel; the board
+continues to record notifications only in its local outbox. The tray picks up
+completed setup on its next refresh.
+
+To select another queue, start a demo tray, or
 open the board directly:
 
 ```bash
@@ -233,11 +267,13 @@ The menu re-reads the queue every 5 seconds and after every action:
 | **Running agents** | Read-only rows `Agent — THR-ID (status)` for thread runs still `running` or `killing`. |
 | **Usage** | One read-only row per configured agent: a 10-cell bar of its highest used percentage across runs / minutes / tokens, e.g. `Alpha [####------] 40%`, with ` WARN` or ` BLOCKED` at the plan thresholds. |
 | `Error: …` | Appears only when reading state or the last action failed; polling keeps going. |
+| **Finish setup...** | Appears when the state directory has no `agents.toml`; opens the board's first-run panel. |
 | **Open app** | Starts the desktop board in a separate process with the tray's `--state-dir`; a demo tray passes `--demo` to open a separate throwaway demo board. |
 | **Refresh** / **Quit** | Re-read now / stop polling and remove the icon. |
 
 Empty sections show a disabled `None` (or `No usage plans`) row. Agents and
-plans come from `agents.toml` in the working directory, if present.
+plans come from the state directory's `agents.toml`, with the working-directory
+file as a legacy fallback.
 
 ```bash
 pip install -e ".[tray]"                           # pystray + Pillow
@@ -253,8 +289,8 @@ Linux also needs the system packages listed below.
 
 **Default data dir (packaged builds).** Run from source, the tray uses
 `--state-dir` or `./state`. The bundled `HITL Queue` app/executable has no
-working directory to rely on, so it reads `state/` and `agents.toml` from the
-per-user data folder:
+working directory to rely on, so its default `state/` lives under the
+per-user data folder (setup configuration lives inside `state/`):
 
 | OS | Folder |
 |---|---|

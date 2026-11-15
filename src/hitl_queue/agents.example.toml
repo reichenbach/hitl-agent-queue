@@ -1,0 +1,63 @@
+# Relative allowed_folders are resolved from this file's directory. This only
+# checks the CLI's starting cwd; it does not sandbox filesystem access. Use
+# extra_args for the selected CLI's own sandbox and permission flags.
+# Create each workspaces directory before configuring threads, and keep the
+# queue state directory outside every allowed folder.
+
+[agents.claude]
+type = "cli"
+command = ["claude", "-p"]
+prompt_via = "arg"
+extra_args = []
+# turns_flag = "--max-turns" # If supported, receives max_turns as its value.
+# env_passthrough = ["ANTHROPIC_API_KEY"] # Added to the minimal default env.
+allowed_folders = ["workspaces/claude"]
+work_dir = "workspaces/claude"
+max_turns = 12
+timeout_seconds = 900
+max_output_bytes = 1048576
+# Optional CLI usage extraction. Named regex groups such as total_tokens,
+# input_tokens and output_tokens are stored; alternatively point at a JSON field.
+# usage_regex = 'tokens: (?P<total_tokens>\d+)'
+# usage_json_field = "usage"
+
+[agents.claude.plan]
+window = "5h" # rolling; "daily" and "weekly" are also supported
+runs = 40
+minutes = 240
+tokens = 1000000
+warn_threshold = 0.8
+blocked_threshold = 1.0
+
+[agents.codex]
+type = "cli"
+command = ["codex", "exec"]
+prompt_via = "arg"
+extra_args = [] # For example, the CLI's own sandbox/approval flags.
+allowed_folders = ["workspaces/codex"]
+work_dir = "workspaces/codex"
+max_turns = 12
+timeout_seconds = 900
+
+[agents.generic]
+type = "cli"
+command = ["agent", "--trust"]
+prompt_via = "stdin"
+allowed_folders = ["workspaces/generic"]
+work_dir = "workspaces/generic"
+max_turns = 12
+timeout_seconds = 900
+
+[agents.local]
+type = "openai_compat"
+# Plain HTTP is allowed for the LAN exception: localhost, private/loopback and
+# link-local IPs (including the metadata address 169.254.169.254), and any host
+# whose name ends in .local. A .local name is trusted by name without DNS/IP
+# resolution, so configure it only when that naming convention is trusted.
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder"
+# api_key_env = "LOCAL_LLM_API_KEY"
+allowed_folders = ["workspaces/local"]
+work_dir = "workspaces/local"
+max_turns = 1
+timeout_seconds = 120

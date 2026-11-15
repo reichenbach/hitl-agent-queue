@@ -10,7 +10,10 @@ a = Analysis(
     [str(ROOT / "packaging" / "hitl_launcher.py")],
     pathex=[str(ROOT / "src")],
     binaries=[],
-    datas=[(str(ROOT / "src" / "hitl_queue" / "app.html"), "hitl_queue")],
+    datas=[
+        (str(ROOT / "src" / "hitl_queue" / "app.html"), "hitl_queue"),
+        (str(ROOT / "agents.example.toml"), "hitl_queue"),
+    ],
     hiddenimports=[
         "hitl_queue.app",
         "hitl_queue.tray",
