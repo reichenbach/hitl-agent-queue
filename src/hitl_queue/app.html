@@ -60,6 +60,15 @@
   button:disabled { opacity: .4; cursor: default; }
   button.approve { border-color: rgba(110, 168, 254, .5); }
   button.skip { border-color: rgba(240, 106, 106, .5); }
+  .ticket-form { margin-top: 10px; }
+  .ticket-form label { display: block; margin: 8px 0; }
+  .ticket-form input, .ticket-form textarea, .ticket-form select {
+    display: block; width: 100%; margin-top: 3px; padding: 6px; font: inherit;
+    background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px;
+  }
+  .ticket-form textarea { resize: vertical; min-height: 100px; }
+  .form-error { color: var(--bad); white-space: pre-wrap; }
+  .ticket-editor > summary { cursor: pointer; color: var(--accent); margin-top: 12px; }
   .hint { color: var(--muted); font-size: 11.5px; }
   .file { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; margin-bottom: 6px; }
   .file .path { color: var(--muted); font-size: 11px; word-break: break-all; }
@@ -79,6 +88,7 @@
 <header>
   <h1>HITL agent queue</h1>
   <span class="sub">__HITL_TITLE__</span>
+  <button id="new-ticket" type="button" hidden>New ticket</button>
 </header>
 <section id="setup-panel" hidden>
   <h2>Set up your queue</h2>
@@ -112,6 +122,8 @@
 const BOOT = /*__HITL_BOOT__*/null || { transport: "http", token: "" };
 let selectedId = null;
 let setupRendered = false;
+let creating = false;
+let ticketChoices = { agents: [], kinds: [] };
 
 function ready() {
   if (BOOT.transport !== "pywebview") return Promise.resolve();
@@ -167,6 +179,7 @@ function renderSetup(setup) {
   document.getElementById("setup-panel").hidden = !needed;
   document.getElementById("queue-board").hidden = needed;
   document.getElementById("gate").hidden = needed;
+  document.getElementById("new-ticket").hidden = needed;
   if (!needed || setupRendered) return needed;
   setupRendered = true;
   const agents = document.getElementById("setup-agents");
@@ -244,8 +257,62 @@ function fileBlock(file) {
   return el("div", { class: "file" }, children);
 }
 
+function ticketForm(ticket = null) {
+  const form = el("form", { class: "ticket-form" });
+  const fields = {};
+  const add = (name, label, value, tag = "input", props = {}) => {
+    const input = el(tag, { name, ...props });
+    input.value = value || "";
+    fields[name] = input;
+    form.append(el("label", {}, [el("span", { text: label }), input]));
+    return input;
+  };
+  add("title", "Title", ticket && ticket.title, "input", { required: true, maxlength: 500 });
+  add("reason", "Details", ticket && ticket.payload.reason, "textarea", { maxlength: 100000 });
+  add("company", "Company / project", ticket && ticket.company, "input", { maxlength: 500 });
+  add("url", "URL", ticket && ticket.url, "input", { maxlength: 4000 });
+  const kind = add("kind", "Kind", "", "select");
+  kind.replaceChildren(...ticketChoices.kinds.map((value) => el("option", { value, text: value })));
+  kind.value = ticket ? ticket.kind : "task";
+  add("owner", "Assigned agent", ticket && ticket.owner, "input", { list: "ticket-agents", maxlength: 100 });
+  form.append(el("datalist", { id: "ticket-agents" }, ticketChoices.agents.map((name) => el("option", { value: name }))));
+  form.append(el("p", { class: "hint", text: "Assignment records an owner. Claiming records the actual worker; approval and handoff use the existing buttons." }));
+  const error = el("p", { class: "form-error", role: "alert" });
+  const save = el("button", { type: "submit", text: ticket ? "Save changes" : "Create ticket" });
+  const cancel = el("button", { type: "button", text: "Cancel", onclick: async () => {
+    creating = false;
+    try { await refresh(); } catch (err) { error.textContent = err.message; }
+  } });
+  form.append(error, el("div", { class: "actions" }, [save, cancel]));
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    save.disabled = true;
+    cancel.disabled = true;
+    error.textContent = "";
+    try {
+      const values = Object.fromEntries(Object.entries(fields).map(([name, input]) => [name, input.value]));
+      const result = ticket ? await call("edit", ticket.id, values) : await call("create", values);
+      if (!result.ok) throw new Error(result.error || "Could not save ticket");
+      creating = false;
+      selectedId = result.ticket.id;
+      await refresh();
+    } catch (err) {
+      error.textContent = err.message;
+    } finally {
+      save.disabled = false;
+      cancel.disabled = false;
+    }
+  });
+  return form;
+}
+
 function renderDetail(detail) {
   const section = document.getElementById("detail");
+  if (creating) {
+    section.replaceChildren(el("h3", { text: "New ticket" }), ticketForm());
+    section.querySelector("input").focus();
+    return;
+  }
   if (!detail || !detail.ok) {
     section.replaceChildren(el("h3", { text: "Ticket" }), el("p", { class: "empty", text: detail ? detail.error : "Select a ticket to see files and history." }));
     return;
@@ -273,6 +340,9 @@ function renderDetail(detail) {
     ]),
     el("div", { class: "hint", text: "Buttons call hitl_queue.actions locally. Nothing is sent." }),
     el("dl", { class: "meta" }, rows.flatMap(([k, v]) => [el("dt", { text: k }), el("dd", { text: String(v) })])),
+    t.can_edit
+      ? el("details", { class: "ticket-editor" }, [el("summary", { text: "Edit ticket" }), ticketForm(t)])
+      : el("p", { class: "hint", text: "Closed tickets and frozen handoffs are read-only." }),
     el("h3", { text: `Files (${detail.files.length})` }),
     ...(detail.files.length ? detail.files.map(fileBlock) : [el("p", { class: "empty", text: "No files yet." })]),
     el("h3", { text: "Status history" }),
@@ -307,6 +377,7 @@ function renderNotifier(n) {
 
 async function refresh() {
   const board = await call("board");
+  ticketChoices = { agents: board.agents, kinds: board.kinds };
   if (renderSetup(board.setup)) return;
   renderGate(board.gate);
   renderBoard(board);
@@ -315,6 +386,7 @@ async function refresh() {
 }
 
 async function select(id) {
+  creating = false;
   selectedId = id;
   try { await refresh(); } catch (err) { toast(err.message, true); }
 }
@@ -333,6 +405,11 @@ async function runAction(name, ...args) {
     toast(err.message, true);
   }
 }
+
+document.getElementById("new-ticket").addEventListener("click", () => {
+  creating = true;
+  renderDetail(null);
+});
 
 ready().then(refresh).catch((err) => toast(err.message, true));
 </script>

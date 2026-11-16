@@ -184,9 +184,25 @@ tickets in a throwaway state dir and ignores `--state-dir`; `--apply-opens`
 is only accepted with `--demo`. The window title and page identify the state
 path or demo mode. The board shows one column per status, a collapsed
 blocked/skipped/cancelled lane, ticket files and status history, and the
-`apply_opens` gate. Approve and Skip buttons call `hitl_queue.actions`.
+`apply_opens` gate. **New ticket** creates a ticket in `new`; select a ticket
+and expand **Edit ticket** to change its title, details, company/project, URL,
+kind, or assigned agent. Agent suggestions come from the loaded configuration;
+an empty assignment leaves it unassigned. Assignment records the owner; a later
+claim records the actual worker. It does not approve a ticket or start an agent.
+Edits preserve ticket IDs, status, artifacts, and approval metadata, and appear
+in status history. Closed tickets (`done`, `skipped`, `cancelled`) and tickets
+with a frozen handoff packet are read-only. Validation errors appear in the form.
+Approve and Skip buttons call `hitl_queue.actions`.
 Notifications go to a local outbox panel with a mute toggle and are never
 sent in either mode. File previews only read files inside the state dir.
+
+The board's authenticated JSON bridge also exposes `POST /api/create` with
+`{"args":[{"title":"Update guide","reason":"Details","owner":"codex"}]}` and
+`POST /api/edit` with `{"args":["TKT-0001",{"title":"Revised guide"}]}`.
+Both require the page's `X-Hitl-Token` and the existing localhost Host check;
+invalid fields or read-only tickets return HTTP 400. These use the existing
+SQLite ticket format and transactions. Python callers can use
+`queue.create_ticket(fields)` and `queue.edit_ticket(ticket_id, fields)`.
 
 ## Desktop application bundle
 

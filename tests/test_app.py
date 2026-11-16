@@ -51,6 +51,22 @@ class _DemoCase(unittest.TestCase):
 
 
 class AppApiTests(_DemoCase):
+    def test_create_and_edit_work_through_bridge(self):
+        created = self.api.create({"title": "Board request", "reason": "Details", "owner": "worker"})
+        self.assertTrue(created["ok"])
+        tid = created["ticket"]["id"]
+        self.assertTrue(self.api.ticket(tid)["ticket"]["can_edit"])
+        edited = self.api.edit(tid, {"title": "Updated request"})
+        self.assertTrue(edited["ok"])
+        self.assertEqual(edited["ticket"]["title"], "Updated request")
+        self.assertEqual(edited["ticket"]["payload"]["reason"], "Details")
+        self.assertEqual(self.api.notifier()["outbox"][0]["source"], "hitl-new")
+        self.assertFalse(self.api.create({"title": None})["ok"])
+        self.assertFalse(self.api.edit(tid, {"status": "done"})["ok"])
+        self.assertFalse(self.api.edit(self.first("done"), {"title": "No"})["ok"])
+        self.assertFalse(self.api.ticket(self.first("handoff"))["ticket"]["can_edit"])
+        self.assertEqual(self.api.board()["kinds"], sorted(app.KINDS))
+
     def test_seed_fills_every_lane_and_starts_with_empty_outbox(self):
         counts = self.queue.count_by_status()
         for status in BOARD_STATUSES + SIDE_LANE_STATUSES:
@@ -163,13 +179,16 @@ class WebviewApiTests(_DemoCase):
         def call():
             results.append(api.board())
             results.append(api.ticket(self.first("review")))
+            created = api.create({"title": "From webview"})
+            results.append(created)
+            results.append(api.edit(created["ticket"]["id"], {"reason": "Updated"}))
 
         thread = threading.Thread(target=call)
         thread.start()
         thread.join(timeout=5)
 
-        self.assertEqual(len(results), 2)
-        self.assertTrue(results[1]["ok"])
+        self.assertEqual(len(results), 4)
+        self.assertTrue(all(result["ok"] for result in results[1:]))
         self.assertEqual(self.queue._all_connections, {main_connection})
         main_connection.execute("SELECT 1").fetchone()
 
@@ -195,7 +214,98 @@ class OpenGateTests(_DemoCase):
             demo_config("not-a-date")
 
 
-class HttpFallbackTests(_DemoCase):
+class _TicketEndpoints:
+    """Shared checks for real HTTP and the socket-free handler harness."""
+
+    def test_create_and_edit_endpoints(self):
+        code, result = self._post("create", [{"title": "New from board", "reason": "Line 1\nLine 2"}], token=self.token)
+        self.assertEqual(code, 200)
+        tid = result["ticket"]["id"]
+        self.assertEqual(result["ticket"]["status"], "new")
+        code, result = self._post("edit", [tid, {"title": "Edited from board", "owner": "worker"}], token=self.token)
+        self.assertEqual(code, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["ticket"]["id"], tid)
+        self.assertEqual(result["ticket"]["title"], "Edited from board")
+        self.assertEqual(result["ticket"]["payload"]["reason"], "Line 1\nLine 2")
+        self.assertEqual(self.queue.get(tid)["owner"], "worker")
+
+    def test_ticket_endpoints_reject_bad_fields_with_400(self):
+        tid = self.first("new")
+        before = self.queue.get(tid)
+        for fields in (None, [], "bad", {}, {"title": " "}, {"title": 123},
+                       {"owner": {}}, {"title": "x" * 501}, {"kind": "bad"},
+                       {"payload": {"preferred_worker": "codex"}}, {"status": "done"}):
+            for name, args in (("create", [fields]), ("edit", [tid, fields])):
+                with self.subTest(name=name, fields=str(fields)[:80]):
+                    code, result = self._post(name, args, token=self.token)
+                    self.assertEqual(code, 400)
+                    self.assertFalse(result["ok"])
+                    self.assertTrue(result["error"])
+        self.assertEqual(self.queue.get(tid), before)
+        self.assertEqual(self._post("edit", ["TKT-9999", {"title": "Missing"}], token=self.token)[0], 400)
+
+    def test_ticket_endpoints_cannot_edit_closed_or_handed_off_tickets(self):
+        for status in ("done", "skipped", "cancelled", "handoff"):
+            tid = self.first(status)
+            before = self.queue.get(tid)
+            code, result = self._post("edit", [tid, {"title": "No"}], token=self.token)
+            self.assertEqual(code, 400)
+            self.assertIn("Cannot edit", result["error"])
+            self.assertEqual(self.queue.get(tid), before)
+
+    def test_ticket_endpoints_require_token_and_local_host(self):
+        tid = self.first("new")
+        before = self.queue.get(tid)
+        count = len(self.queue.list(include_terminal=True))
+        for name, args in (("create", [{"title": "No"}]), ("edit", [tid, {"title": "No"}])):
+            self.assertEqual(self._post(name, args)[0], 401)
+            self.assertEqual(self._post(name, args, token="wrong")[0], 401)
+            self.assertEqual(self._post(name, args, token=self.token, host=f"evil.example:{self.port}")[0], 403)
+        self.assertEqual(len(self.queue.list(include_terminal=True)), count)
+        self.assertEqual(self.queue.get(tid), before)
+
+    def test_ticket_endpoints_reject_bad_json_and_arguments(self):
+        for name in ("create", "edit"):
+            for body in (b"not json", b"[]", b'{"args": {}}', b'{"args": null}', b'{"args": false}'):
+                self.assertEqual(self._post(name, token=self.token, body=body)[0], 400)
+            self.assertEqual(self._post(name, token=self.token)[0], 400)
+
+
+class HttpHandlerTests(_TicketEndpoints, _DemoCase):
+    """Exercise the HTTP parser and endpoints without binding a localhost port."""
+
+    def setUp(self):
+        super().setUp()
+        self.port = 8787
+        self.token = "test-board-token"
+
+    def _post(self, name, args=(), *, token=None, host=None, body=None):
+        data = body if body is not None else json.dumps({"args": list(args)}).encode()
+        headers = [f"Host: {host or f'127.0.0.1:{self.port}'}", f"Content-Length: {len(data)}",
+                   "Content-Type: application/json"]
+        if token is not None:
+            headers.append(f"X-Hitl-Token: {token}")
+        request = (f"POST /api/{name} HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n").encode() + data
+
+        class Socket:
+            def __init__(self):
+                self.response = bytearray()
+
+            def makefile(self, *args):
+                return io.BytesIO(request)
+
+            def sendall(self, data):
+                self.response.extend(data)
+
+        sock = Socket()
+        handler = app.make_http_handler(self.api, self.token, "test page")
+        handler(sock, ("127.0.0.1", 12345), types.SimpleNamespace(server_address=("127.0.0.1", self.port)))
+        head, body = bytes(sock.response).split(b"\r\n\r\n", 1)
+        return int(head.split()[1]), json.loads(body)
+
+
+class HttpFallbackTests(_TicketEndpoints, _DemoCase):
     def setUp(self):
         super().setUp()
         self.httpd = make_server(self.api)
@@ -477,6 +587,7 @@ class RealAppTests(unittest.TestCase):
         def check_board(api, **kwargs):
             self.assertFalse(api.board()["setup"]["needed"])
             self.assertEqual(api.usage()[0]["agent"], "claude")
+            self.assertEqual(api.board()["agents"], ["claude"])
             self.assertEqual(api.notifier()["configured"], "teams")
             return 0
 
@@ -504,6 +615,7 @@ class RealAppTests(unittest.TestCase):
                     self.assertEqual(api._queue.state, state)
                     self.assertEqual(api._queue.cfg["max_review_rounds"], 5)
                     self.assertEqual(api.usage()[0]["agent"], "worker")
+                    self.assertEqual(api.board()["agents"], ["worker"])
                     self.assertFalse(any(c["tickets"] for c in api.board()["columns"]))
                     return 0
 

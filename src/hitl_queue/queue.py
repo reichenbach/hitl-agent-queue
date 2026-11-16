@@ -25,6 +25,11 @@ STATUSES = {
 }
 TERMINAL = {"done", "skipped", "cancelled"}
 KINDS = {"task", "job_draft", "site", "general"}
+EDITABLE_STATUSES = STATUSES - TERMINAL - {"handoff"}
+TICKET_FIELD_LIMITS = {
+    "title": 500, "company": 500, "url": 4000, "kind": 32,
+    "reason": 100_000, "owner": 100,
+}
 
 TRANSITIONS = {
     "new": {"drafting", "skipped", "cancelled", "blocked"},
@@ -273,34 +278,35 @@ class Queue:
         url: str = "",
         kind: str = "task",
         reason: str = "",
+        owner: str = "",
         actor: str = "dispatcher",
     ) -> dict:
-        if kind not in KINDS:
-            raise ValueError(f"kind must be one of {sorted(KINDS)}")
-        if not title.strip():
-            raise ValueError("title required")
+        fields = self._ticket_fields({
+            "title": title, "company": company, "url": url, "kind": kind,
+            "reason": reason, "owner": owner,
+        }, creating=True)
 
         def action():
             tid = self._next_id()
             stamp = time.time()
-            payload = {"reason": reason, "artifacts": {}, "notes": ""}
+            payload = {"reason": fields["reason"], "artifacts": {}, "notes": ""}
             self.db.execute(
                 "INSERT INTO tickets(id,kind,status,title,company,url,owner,payload,created,updated) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     tid,
-                    kind,
+                    fields["kind"],
                     "new",
-                    title.strip(),
-                    company.strip(),
-                    url.strip() or None,
-                    None,
+                    fields["title"],
+                    fields["company"],
+                    fields["url"] or None,
+                    fields["owner"] or None,
                     json.dumps(payload, sort_keys=True),
                     stamp,
                     stamp,
                 ),
             )
-            self._event(tid, "new", actor, reason)
+            self._event(tid, "new", actor, fields["reason"])
             return self.get(tid)
 
         ticket = self.transaction(action)
@@ -310,6 +316,74 @@ class Queue:
             source="hitl-new",
         )
         return ticket
+
+    @staticmethod
+    def _ticket_fields(fields: dict, *, creating: bool = False) -> dict:
+        """Validate only human-editable fields; never accept arbitrary payloads."""
+        if not isinstance(fields, dict):
+            raise ValueError("fields must be an object")
+        unknown = fields.keys() - TICKET_FIELD_LIMITS.keys()
+        if unknown:
+            raise ValueError(f"Unknown ticket fields: {', '.join(sorted(map(str, unknown)))}")
+        if creating and "title" not in fields:
+            raise ValueError("title required")
+        if not fields:
+            raise ValueError("At least one editable field required")
+        result = {}
+        for name, value in fields.items():
+            if not isinstance(value, str):
+                raise ValueError(f"{name} must be a string")
+            if len(value) > TICKET_FIELD_LIMITS[name]:
+                raise ValueError(f"{name} must be at most {TICKET_FIELD_LIMITS[name]} characters")
+            if "\x00" in value:
+                raise ValueError(f"{name} must not contain NUL characters")
+            # Keep multiline details intact, including intentional whitespace.
+            result[name] = value if name == "reason" else value.strip()
+        if "title" in result and not result["title"]:
+            raise ValueError("title required")
+        if "kind" in result and result["kind"] not in KINDS:
+            raise ValueError(f"kind must be one of {sorted(KINDS)}")
+        return result
+
+    def create_ticket(self, fields: dict, *, actor: str = "human") -> dict:
+        """Create a normal new ticket through the existing enqueue transaction.
+
+        ``owner`` records assignment, not approval or an automatic agent run.
+        A later claim continues to record the worker who actually claimed it.
+        """
+        return self.enqueue(**self._ticket_fields(fields, creating=True), actor=actor)
+
+    @staticmethod
+    def can_edit(ticket: dict) -> bool:
+        # A handoff packet is frozen, including when that handoff later blocks.
+        return ticket["status"] in EDITABLE_STATUSES and not ticket["payload"].get("handoff")
+
+    def edit_ticket(self, tid: str, fields: dict, *, actor: str = "human") -> dict:
+        """Patch editable fields atomically, preserving identity and workflow data."""
+        if not isinstance(tid, str) or not tid.strip():
+            raise ValueError("ticket_id must be a nonempty string")
+        fields = self._ticket_fields(fields)
+
+        def action():
+            ticket = self.get(tid)
+            if not self.can_edit(ticket):
+                raise ValueError(f"Cannot edit {tid}: ticket is {ticket['status']} or has a frozen handoff")
+            payload = ticket["payload"]
+            if "reason" in fields:
+                payload["reason"] = fields["reason"]
+            for name in ("title", "company", "url", "owner", "kind"):
+                if name in fields:
+                    ticket[name] = fields[name]
+            self.db.execute(
+                "UPDATE tickets SET title=?,company=?,url=?,owner=?,kind=?,payload=?,updated=? WHERE id=?",
+                (ticket["title"], ticket["company"], ticket["url"] or None,
+                 ticket["owner"] or None, ticket["kind"], json.dumps(payload, sort_keys=True),
+                 time.time(), tid),
+            )
+            self._event(tid, ticket["status"], actor, f"Edited fields: {', '.join(sorted(fields))}")
+            return self.get(tid)
+
+        return self.transaction(action)
 
     def claim(self, tid: str | None, worker: str) -> dict:
         def action():
