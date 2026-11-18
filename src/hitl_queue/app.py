@@ -33,13 +33,13 @@ from pathlib import Path
 
 from .paths import user_data_dir
 from .notify import notifier_name
-from .queue import DEFAULT_CONFIG, TRANSITIONS, Queue, apply_gate_open
+from .queue import DEFAULT_CONFIG, KINDS, TRANSITIONS, Queue, apply_gate_open
 from .setup import agents_file, setup_queue, setup_status
 
 BOARD_STATUSES = ["new", "drafting", "review", "approved", "handoff", "done"]
 SIDE_LANE_STATUSES = ["blocked", "skipped", "cancelled"]
 APPROVABLE = {"new", "drafting", "review", "approved"}
-API_METHODS = ("board", "ticket", "approve", "skip", "set_mute", "usage", "setup")
+API_METHODS = ("board", "ticket", "create", "edit", "approve", "skip", "set_mute", "usage", "setup")
 PREVIEW_BYTES = 4000
 MAX_BODY_BYTES = 1024 * 1024
 PAGE = Path(__file__).with_name("app.html")
@@ -186,10 +186,11 @@ class AppApi:
         self._title = f"HITL Queue — {'demo data' if demo else queue.state}"
 
     @staticmethod
-    def _controls(status: str) -> dict:
+    def _controls(status: str, payload: dict) -> dict:
         return {
             "can_approve": status in APPROVABLE,
             "can_skip": "skipped" in TRANSITIONS.get(status, set()),
+            "can_edit": Queue.can_edit({"status": status, "payload": payload}),
         }
 
     def _card(self, row: dict) -> dict:
@@ -198,20 +199,23 @@ class AppApi:
             **row,
             "preferred_worker": payload.get("preferred_worker"),
             "handoff_worker": (payload.get("handoff") or {}).get("worker"),
-            **self._controls(row["status"]),
+            **self._controls(row["status"], payload),
         }
 
     def board(self) -> dict:
         lanes: dict[str, list[dict]] = {s: [] for s in BOARD_STATUSES + SIDE_LANE_STATUSES}
         for row in self._queue.list(include_terminal=True):
             lanes.setdefault(row["status"], []).append(self._card(row))
+        usage = self.usage()
         return {
             "columns": [{"status": s, "tickets": lanes[s]} for s in BOARD_STATUSES],
             "side_lane": [{"status": s, "tickets": lanes[s]} for s in SIDE_LANE_STATUSES],
             "counts": self._queue.count_by_status(),
             "gate": self.gate(),
             "notifier": self.notifier(),
-            "usage": self.usage(),
+            "usage": usage,
+            "agents": [item["agent"] for item in usage],
+            "kinds": sorted(KINDS),
             "setup": None if self._demo else setup_status(self._queue.state),
         }
 
@@ -238,10 +242,23 @@ class AppApi:
             return {"ok": False, "error": str(exc)}
         return {
             "ok": True,
-            "ticket": {**ticket, **self._controls(ticket["status"])},
+            "ticket": {**ticket, **self._controls(ticket["status"], ticket["payload"])},
             "history": self._queue.history(ticket["id"]),
             "files": self._files(ticket),
         }
+
+    def create(self, fields: dict) -> dict:
+        return self._save_ticket(self._queue.create_ticket, fields)
+
+    def edit(self, ticket_id: str, fields: dict) -> dict:
+        return self._save_ticket(self._queue.edit_ticket, ticket_id, fields)
+
+    @staticmethod
+    def _save_ticket(fn, *args) -> dict:
+        try:
+            return {"ok": True, "ticket": fn(*args)}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
 
     def _files(self, ticket: dict) -> list[dict]:
         payload = ticket.get("payload") or {}
@@ -392,7 +409,7 @@ def make_http_handler(api: AppApi, token: str, page: str):
                 return self._error(413, "request body too large")
             raw = self.rfile.read(length)
             try:
-                args = json.loads(raw.decode("utf-8") or "{}").get("args") or []
+                args = json.loads(raw.decode("utf-8") or "{}").get("args", [])
             except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
                 return self._error(400, "invalid JSON")
             if not isinstance(args, list):
@@ -407,7 +424,7 @@ def make_http_handler(api: AppApi, token: str, page: str):
                 return self._error(500, "internal error")
             finally:
                 api._release_thread()
-            self._send(200, body)
+            self._send(400 if name in {"create", "edit"} and not result.get("ok") else 200, body)
 
     return Handler
 

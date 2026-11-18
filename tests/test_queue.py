@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import tempfile
+import json
 import threading
 import unittest
 from pathlib import Path
@@ -23,6 +24,128 @@ class QueueTests(unittest.TestCase):
     def tearDown(self):
         self.q.close()
         self.tmp.cleanup()
+
+    def test_create_ticket_uses_existing_format_and_persists(self):
+        ticket = self.q.create_ticket({
+            "title": "  Refresh guide  ", "company": " Example ", "url": " https://example.com ",
+            "kind": "general", "reason": "First line\n  Second line\n", "owner": " agent-one ",
+        })
+        self.assertEqual(ticket["id"], "TKT-0001")
+        self.assertEqual(ticket["status"], "new")
+        self.assertEqual(ticket["title"], "Refresh guide")
+        self.assertEqual(ticket["company"], "Example")
+        self.assertEqual(ticket["url"], "https://example.com")
+        self.assertEqual(ticket["owner"], "agent-one")
+        self.assertEqual(ticket["kind"], "general")
+        self.assertEqual(ticket["payload"], {
+            "reason": "First line\n  Second line\n", "artifacts": {}, "notes": "",
+        })
+        self.assertEqual(self.q.history(ticket["id"])[0]["actor"], "human")
+        self.assertNotIn("preferred_worker", ticket["payload"])
+        self.q.close()
+        self.assertEqual(self.q.get(ticket["id"]), ticket)
+        next_ticket = self.q.enqueue(title="Existing enqueue still works")
+        self.assertEqual(next_ticket["id"], "TKT-0002")
+        self.assertIsNone(next_ticket["owner"])
+
+    def test_edit_preserves_identity_workflow_and_unrelated_payload(self):
+        ticket = self.q.enqueue(title="Original", company="Example")
+        tid = ticket["id"]
+        self.q.claim(tid, "cursor-draft")
+        self.q.submit_draft(tid, actor="cursor-draft", resume="brief.md", research_summary="Research")
+        self.q.set_preferred_worker(tid, "codex")
+        before = self.q.get(tid)
+        updated = self.q.edit_ticket(tid, {
+            "title": " Updated ", "reason": "Details\nwith a second line", "owner": "claude",
+            "company": "New project", "url": "https://example.com/new", "kind": "site",
+        })
+        for key in ("id", "created", "status"):
+            self.assertEqual(updated[key], before[key])
+        self.assertGreaterEqual(updated["updated"], before["updated"])
+        self.assertEqual(updated["title"], "Updated")
+        self.assertEqual(updated["owner"], "claude")
+        self.assertEqual(updated["kind"], "site")
+        self.assertEqual(updated["company"], "New project")
+        self.assertEqual(updated["url"], "https://example.com/new")
+        self.assertEqual(updated["payload"], {
+            **before["payload"], "reason": "Details\nwith a second line",
+        })
+        event = self.q.history(tid)[-1]
+        self.assertEqual((event["status"], event["actor"]), ("review", "human"))
+        self.assertIn("Edited fields:", event["note"])
+        self.q.close()
+        self.assertEqual(self.q.get(tid), updated)
+
+    def test_edit_partial_fields_and_clear_optional_fields(self):
+        ticket = self.q.create_ticket({"title": "Keep", "reason": "Keep details", "owner": "agent"})
+        edited = self.q.edit_ticket(ticket["id"], {"company": "Changed"})
+        self.assertEqual(edited["title"], "Keep")
+        self.assertEqual(edited["payload"], ticket["payload"])
+        self.assertEqual(edited["owner"], "agent")
+        edited = self.q.edit_ticket(ticket["id"], {"owner": "", "url": "", "reason": ""})
+        self.assertIsNone(edited["owner"])
+        self.assertIsNone(edited["url"])
+        self.assertEqual(edited["payload"]["reason"], "")
+
+    def test_ticket_validation_does_not_mutate_or_consume_ids(self):
+        bad_fields = [None, [], "title", {}, {"title": " "}, {"title": 1},
+                      {"title": "x" * 501}, {"reason": "x" * 100001},
+                      {"owner": False}, {"company": None}, {"url": []},
+                      {"kind": "unknown"}, {"title": "bad\x00title"},
+                      {"id": "TKT-1234"}, {"status": "done"}, {"payload": {}},
+                      {"created": 0}, {"preferred_worker": "codex"}]
+        for fields in bad_fields:
+            with self.subTest(fields=str(fields)[:80]), self.assertRaises(ValueError):
+                self.q.create_ticket(fields)
+        self.assertEqual(self.q.list(include_terminal=True), [])
+        ticket = self.q.enqueue(title="Unchanged")
+        self.assertEqual(ticket["id"], "TKT-0001")
+        history = self.q.history(ticket["id"])
+        for fields in bad_fields:
+            with self.subTest(fields=str(fields)[:80]), self.assertRaises(ValueError):
+                self.q.edit_ticket(ticket["id"], fields)
+            self.assertEqual(self.q.get(ticket["id"]), ticket)
+            self.assertEqual(self.q.history(ticket["id"]), history)
+        with self.assertRaisesRegex(ValueError, "Unknown ticket"):
+            self.q.edit_ticket("TKT-9999", {"title": "Missing"})
+        with self.assertRaisesRegex(ValueError, "ticket_id"):
+            self.q.edit_ticket([], {"title": "Missing"})
+
+    def test_closed_tickets_and_frozen_handoffs_cannot_be_edited(self):
+        for status in ("done", "skipped", "cancelled", "handoff"):
+            ticket = self.q.enqueue(title=status)
+            self.q.db.execute("UPDATE tickets SET status=? WHERE id=?", (status, ticket["id"]))
+            before = self.q.get(ticket["id"])
+            with self.subTest(status=status), self.assertRaisesRegex(ValueError, "Cannot edit"):
+                self.q.edit_ticket(ticket["id"], {"title": "Changed"})
+            self.assertEqual(self.q.get(ticket["id"]), before)
+        ticket = self.q.enqueue(title="Blocked handoff")
+        self.q.db.execute("UPDATE tickets SET status='blocked',payload=? WHERE id=?", (
+            json.dumps({**ticket["payload"], "handoff": {"worker": "codex"}}), ticket["id"],
+        ))
+        with self.assertRaisesRegex(ValueError, "frozen handoff"):
+            self.q.edit_ticket(ticket["id"], {"title": "Changed"})
+
+    def test_edits_allowed_before_handoff(self):
+        for status in ("new", "drafting", "review", "approved", "blocked"):
+            ticket = self.q.enqueue(title=status)
+            self.q.db.execute("UPDATE tickets SET status=? WHERE id=?", (status, ticket["id"]))
+            with self.subTest(status=status):
+                self.assertEqual(self.q.edit_ticket(ticket["id"], {"title": "Updated"})["status"], status)
+
+    def test_ticket_writes_and_history_roll_back_together(self):
+        with mock.patch.object(self.q, "_event", side_effect=RuntimeError("write failed")):
+            with self.assertRaisesRegex(RuntimeError, "write failed"):
+                self.q.create_ticket({"title": "Rolled back"})
+        self.assertEqual(self.q.list(include_terminal=True), [])
+        ticket = self.q.create_ticket({"title": "Keep"})
+        self.assertEqual(ticket["id"], "TKT-0001")
+        history = self.q.history(ticket["id"])
+        with mock.patch.object(self.q, "_event", side_effect=RuntimeError("write failed")):
+            with self.assertRaisesRegex(RuntimeError, "write failed"):
+                self.q.edit_ticket(ticket["id"], {"title": "Rolled back", "reason": "New"})
+        self.assertEqual(self.q.get(ticket["id"]), ticket)
+        self.assertEqual(self.q.history(ticket["id"]), history)
 
     def test_prefer_then_auto_handoff(self):
         t = self.q.enqueue(title="Workflow Engineer", company="Acme", kind="job_draft")

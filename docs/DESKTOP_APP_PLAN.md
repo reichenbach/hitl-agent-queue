@@ -17,6 +17,10 @@ app are on `main`. The board only showed throwaway demo data.
    the tray links to setup. Shared non-interactive `setup` creates missing
    state-local configuration from the bundled example and sibling workspaces.
    Settings store only notifier/environment variable names, never secrets.
-4. **Create and edit tickets from the board,** not only approve/skip.
+4. **Create and edit tickets from the board (done).** New ticket and inline
+   editing reuse the queue's ticket fields and atomic SQLite transactions.
+   Forms show validation errors and configured agent suggestions; closed tickets
+   and frozen handoffs stay read-only. JSON create/edit endpoints use the
+   board's existing token and localhost protections.
 5. **Distribution.** App icon, codesigning and notarization for macOS, Windows
    installer, CI build artifacts. Needs Matt's decision on signing accounts.
