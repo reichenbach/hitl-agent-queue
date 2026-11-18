@@ -108,6 +108,7 @@ class TrayModelTests(unittest.TestCase):
             for demo in (False, True):
                 with self.subTest(frozen=frozen, demo=demo), \
                         mock.patch.object(sys, "frozen", frozen, create=True), \
+                        mock.patch.object(sys, "executable", "HITL Queue" if frozen else "python"), \
                         mock.patch.object(tray.subprocess, "Popen") as popen:
                     model = TrayModel(self.queue, demo=demo)
                     result = next(item for item in model.items if item.text == "Open app").action()
@@ -135,10 +136,11 @@ class TrayModelTests(unittest.TestCase):
                 model.assert_called_once_with(self.queue, demo=demo)
 
     def test_frozen_open_app_command_routes_through_packaged_launcher(self):
-        launcher = Path(__file__).resolve().parents[1] / "packaging/hitl_tray_launcher.py"
+        launcher = Path(__file__).resolve().parents[1] / "packaging/hitl_launcher.py"
         for demo in (False, True):
             with self.subTest(demo=demo), \
                     mock.patch.object(sys, "frozen", True, create=True), \
+                    mock.patch.object(sys, "executable", "HITL Queue"), \
                     mock.patch.object(tray.subprocess, "Popen") as popen:
                 tray.launch_desktop_app(state_dir=self.queue.state, demo=demo)
                 command = popen.call_args.args[0]
@@ -151,6 +153,21 @@ class TrayModelTests(unittest.TestCase):
                     state_dir=str(self.queue.state), demo=demo,
                     force_browser=False, port=0, apply_opens=None,
                 )
+
+    def test_packaged_launcher_defaults_to_tray_and_forwards_options(self):
+        launcher = Path(__file__).resolve().parents[1] / "packaging/hitl_launcher.py"
+        for arguments, state_dir, demo in (
+            ([], None, False),
+            (["--state-dir", "public state"], "public state", False),
+            (["--demo"], None, True),
+        ):
+            with self.subTest(arguments=arguments), \
+                    mock.patch.object(sys, "argv", ["HITL Queue", *arguments]), \
+                    mock.patch("hitl_queue.tray.launch", return_value=0) as launch:
+                with self.assertRaises(SystemExit) as raised:
+                    runpy.run_path(str(launcher), run_name="__main__")
+            self.assertEqual(raised.exception.code, 0)
+            launch.assert_called_once_with(state_dir=state_dir, demo=demo)
 
     def test_ticket_title_is_single_line_bounded_and_strips_bidi_controls(self):
         self.queue.tickets[0]["title"] = "  Review\nthis\u0085\u202e " + "x" * 80

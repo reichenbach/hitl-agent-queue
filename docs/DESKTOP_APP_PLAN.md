@@ -10,9 +10,9 @@ app are on `main`. The board only showed throwaway demo data.
    `--state-dir` (or `./state` from source, or the per-user data dir in packaged
    builds); `--demo` keeps the synthetic board. The tray's "Open app" opens the
    same state dir. The data-dir helper is shared in `paths.py`.
-2. **One bundle.** Ship the board and tray as a single app (tray starts on
-   launch, board opens from it) instead of two PyInstaller targets; fix the
-   frozen "Open app" path so the tray bundle can launch the board.
+2. **One bundle (done).** `make bundle` builds `HITL Queue` with the board and
+   tray extras. Launch starts the tray; "Open app" runs the same frozen
+   executable with `app --state-dir ...` to open the board directly.
 3. **First-run setup.** On an empty data dir, offer to create `agents.toml`
    from the example and pick a notifier; no secrets stored in the bundle.
 4. **Create and edit tickets from the board,** not only approve/skip.
