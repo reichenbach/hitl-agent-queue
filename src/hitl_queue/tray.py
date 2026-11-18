@@ -19,7 +19,7 @@ from typing import Callable, Sequence
 from .paths import user_data_dir
 from .notify import get_notifier
 from .queue import Queue
-from .setup import needs_setup
+from .setup import agents_file, needs_setup
 from .text import sanitize_summary
 
 logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ class TrayModel:
         """Re-read all state. Errors become a menu row instead of killing polling."""
         try:
             if not self.demo and not self._setup_loaded and not needs_setup(self.queue.state):
-                self.queue.threads.configure_from(self.queue.state / "agents.toml")
+                self.queue.threads.configure_from(agents_file(self.queue.state))
                 self.queue.notifier = get_notifier(self.queue.state)
                 self._setup_loaded = True
             approvals = self._approval_items()
@@ -338,11 +338,9 @@ def launch(*, state_dir: str | Path | None = None, demo: bool = False) -> int:
             frozen_dir / "state" if frozen_dir else Path("state")
         )
         queue = Queue(resolved_state)
-        agents_file = resolved_state / "agents.toml"
-        if not agents_file.is_file():
-            agents_file = frozen_dir / "agents.toml" if frozen_dir else Path("agents.toml")
-        if agents_file.is_file():
-            queue.threads.configure_from(agents_file)
+        config = agents_file(resolved_state, data_dir=frozen_dir)
+        if config is not None:
+            queue.threads.configure_from(config)
     application = None
     try:
         application = TrayApplication(TrayModel(queue, demo=demo))

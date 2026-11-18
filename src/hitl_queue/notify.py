@@ -258,10 +258,30 @@ def notifier_name(state_dir: str | Path | None = None) -> str:
     """Explicit environment selection wins over the saved first-run choice."""
     mode = os.environ.get("HITL_NOTIFY")
     if not mode and state_dir is not None:
-        settings = Path(state_dir) / "settings.json"
-        if settings.is_file():
-            mode = json.loads(settings.read_text(encoding="utf-8")).get("notifier")
+        mode = _saved_notifier(Path(state_dir) / "settings.json")
     return (mode or "stdout").lower().strip()
+
+
+def _saved_notifier(settings: Path) -> str | None:
+    """A broken settings.json must not stop the queue; warn and use stdout."""
+    if not settings.is_file():
+        return None
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        logger.warning("Ignoring unreadable %s (%s); using stdout notifier", settings, exc)
+        return None
+    if not isinstance(data, dict):
+        logger.warning("Ignoring %s: expected a JSON object; using stdout notifier", settings)
+        return None
+    name = data.get("notifier")
+    if name is None:
+        return None
+    key = name.strip().lower() if isinstance(name, str) else None
+    if key not in _BUILDERS and key != "multi":
+        logger.warning("Ignoring unknown notifier %r in %s; using stdout notifier", name, settings)
+        return None
+    return key
 
 
 def build_notifier(name: str):

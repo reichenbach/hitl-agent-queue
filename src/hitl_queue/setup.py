@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
+from . import paths
 from .agents.config import tomllib
 from .notify import NOTIFIER_ENV
 
@@ -19,8 +21,27 @@ def _example() -> dict:
     return tomllib.loads(example_path().read_text(encoding="utf-8"))["agents"]
 
 
-def needs_setup(state_dir: str | Path) -> bool:
-    return not (Path(state_dir) / "agents.toml").is_file()
+_AUTO = object()
+
+
+def agents_file(state_dir: str | Path, *, data_dir=_AUTO) -> Path | None:
+    """Return the agents.toml the app and tray load, or None if there is none.
+
+    Order: ``<state>/agents.toml``, then the legacy location, which is the
+    per-user data dir when frozen and ``./agents.toml`` otherwise. Pass
+    ``data_dir`` (``None`` for source runs) to reuse a caller's resolution.
+    """
+    state_file = Path(state_dir) / "agents.toml"
+    if state_file.is_file():
+        return state_file
+    if data_dir is _AUTO:
+        data_dir = paths.user_data_dir() if getattr(sys, "frozen", False) else None
+    legacy = Path(data_dir) / "agents.toml" if data_dir is not None else Path("agents.toml")
+    return legacy if legacy.is_file() else None
+
+
+def needs_setup(state_dir: str | Path, *, data_dir=_AUTO) -> bool:
+    return agents_file(state_dir, data_dir=data_dir) is None
 
 
 def setup_status(state_dir: str | Path) -> dict:
@@ -67,9 +88,10 @@ def setup_queue(
     if notifier not in NOTIFIER_ENV:
         raise ValueError(f"Choose a notifier from: {', '.join(NOTIFIER_ENV)}")
     state = Path(state_dir).expanduser().resolve()
-    agents_file = state / "agents.toml"
+    agents_target = state / "agents.toml"
     created = []
-    if not agents_file.exists():
+    # An existing state-local or legacy config means setup is complete.
+    if needs_setup(state) and not agents_target.exists():
         workspace_root = state.with_name(state.name + "-workspaces")
         tables = []
         folders = set()
@@ -91,12 +113,14 @@ def setup_queue(
             data["allowed_folders"] = [folder(raw) for raw in data["allowed_folders"]]
             data["work_dir"] = folder(data["work_dir"])
             tables.append(_toml_table(f"agents.{json.dumps(name)}", data))
-        state.mkdir(parents=True, exist_ok=True)
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
         for path in folders:
-            path.mkdir(parents=True, exist_ok=True)
-        if _write_new(agents_file, "\n".join(tables)):
+            if workspace_root in path.parents:
+                workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if _write_new(agents_target, "\n".join(tables)):
             created.append("agents.toml")
-    state.mkdir(parents=True, exist_ok=True)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
     settings = {"notifier": notifier, "notifier_env": NOTIFIER_ENV[notifier]}
     if _write_new(state / "settings.json", json.dumps(settings, indent=2) + "\n"):
         created.append("settings.json")

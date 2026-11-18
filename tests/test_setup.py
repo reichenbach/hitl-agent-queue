@@ -27,6 +27,10 @@ class SetupTests(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
+        # Isolate from the repo's tracked ./agents.toml legacy fallback.
+        old_cwd = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, old_cwd)
 
     def test_status_does_not_create_directory(self):
         status = setup.setup_status(self.state)
@@ -203,6 +207,70 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(queue.usage.summary()[0]["agent"], "claude")
         self.assertIsInstance(queue.notifier, SlackNotifier)
         self.assertFalse(TrayModel(queue, demo=True).refresh_error)
+
+    LEGACY = (
+        "[agents.legacy]\ntype = 'fake'\nallowed_folders = ['legacy-work']\n"
+        "work_dir = 'legacy-work'\nmax_turns = 1\ntimeout_seconds = 1\n"
+    )
+
+    def _legacy(self, directory: Path) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "legacy-work").mkdir(exist_ok=True)
+        path = directory / "agents.toml"
+        path.write_text(self.LEGACY)
+        return path
+
+    def test_legacy_cwd_agents_file_means_setup_is_done_and_is_not_replaced(self):
+        legacy = self._legacy(self.root)
+        self.assertEqual(setup.agents_file(self.state).resolve(), legacy)
+        self.assertFalse(setup.needs_setup(self.state))
+        self.assertFalse(setup.setup_status(self.state)["needed"])
+        result = setup.setup_queue(self.state, ["claude"], "stdout")
+        self.assertNotIn("agents.toml", result["created"])
+        self.assertFalse((self.state / "agents.toml").exists())
+        self.assertFalse((self.root / "state-workspaces").exists())
+        self.assertEqual(legacy.read_text(), self.LEGACY)
+        self.assertFalse(result["needed"])
+
+    def test_legacy_frozen_data_dir_agents_file_means_setup_is_done(self):
+        data_dir = self.root / "user-data"
+        legacy = self._legacy(data_dir)
+        self.assertTrue(setup.needs_setup(self.state))  # source run ignores data dir
+        with mock.patch.object(sys, "frozen", True, create=True), \
+                mock.patch("hitl_queue.paths.user_data_dir", return_value=data_dir):
+            self.assertEqual(setup.agents_file(self.state), legacy)
+            self.assertFalse(setup.needs_setup(self.state))
+            setup.setup_queue(self.state, ["codex"])
+        self.assertFalse((self.state / "agents.toml").exists())
+        self.assertEqual(setup.agents_file(self.state, data_dir=data_dir), legacy)
+        self.assertIsNone(setup.agents_file(self.state, data_dir=None))
+
+    def test_state_local_agents_file_wins_over_legacy(self):
+        setup.setup_queue(self.state, ["claude"])
+        self._legacy(self.root)
+        self.assertEqual(setup.agents_file(self.state), self.state / "agents.toml")
+        self.assertEqual(list(load_agents(setup.agents_file(self.state))), ["claude"])
+
+    def test_app_and_tray_treat_legacy_config_as_complete(self):
+        legacy = self._legacy(self.root)
+        queue = OutboxQueue(self.state)
+        self.addCleanup(queue.close)
+        api = AppApi(queue)
+        self.assertFalse(api.board()["setup"]["needed"])
+        self.assertTrue(api.setup(["claude"], "stdout")["ok"])
+        self.assertFalse((self.state / "agents.toml").exists())
+        self.assertEqual(legacy.read_text(), self.LEGACY)
+        # Save reloads the legacy config; the chosen claude entry is not added.
+        self.assertEqual([row["agent"] for row in api.usage()], ["legacy"])
+        model = TrayModel(queue, app_launcher=mock.Mock())
+        self.assertNotIn("Finish setup...", [item.text for item in model.items])
+
+    def test_created_directories_are_private(self):
+        setup.setup_queue(self.state, ["claude", "codex"])
+        workspaces = self.root / "state-workspaces"
+        for path in (self.state, workspaces, workspaces / "claude", workspaces / "codex"):
+            with self.subTest(path=path.name):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
 
     def test_demo_tray_never_offers_setup(self):
         queue = Queue(self.state)

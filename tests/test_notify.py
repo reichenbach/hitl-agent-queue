@@ -249,5 +249,47 @@ class ReplyServerTests(unittest.TestCase):
         self.assertTrue(body["ok"])
 
 
+class SavedNotifierFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name)
+        env = mock.patch.dict(os.environ, {}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_bad_settings_fall_back_to_stdout_with_warning(self):
+        cases = {
+            "malformed": "{not json",
+            "list": "[1, 2]",
+            "string": '"slack"',
+            "unknown": '{"notifier": "carrier-pigeon"}',
+            "non-string": '{"notifier": 7}',
+            "bad-bytes": b"\xff\xfe\x00",
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                settings = self.state / "settings.json"
+                if isinstance(text, bytes):
+                    settings.write_bytes(text)
+                else:
+                    settings.write_text(text, encoding="utf-8")
+                with self.assertLogs("hitl_queue.notify", level="WARNING"):
+                    self.assertIsInstance(get_notifier(self.state), StdoutNotifier)
+                with self.assertLogs("hitl_queue.notify", level="WARNING"):
+                    queue = Queue(self.state)
+                queue.close()
+                self.assertIsInstance(queue.notifier, StdoutNotifier)
+
+    def test_missing_notifier_key_is_stdout_without_warning(self):
+        (self.state / "settings.json").write_text("{}", encoding="utf-8")
+        with self.assertNoLogs("hitl_queue.notify", level="WARNING"):
+            self.assertIsInstance(get_notifier(self.state), StdoutNotifier)
+
+    def test_valid_saved_notifier_still_used(self):
+        (self.state / "settings.json").write_text('{"notifier": " Slack "}', encoding="utf-8")
+        self.assertIsInstance(get_notifier(self.state), SlackNotifier)
+
+
 if __name__ == "__main__":
     unittest.main()
