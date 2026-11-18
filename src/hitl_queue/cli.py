@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import tempfile
 from pathlib import Path
 
@@ -70,6 +71,26 @@ def cmd_tray(args: argparse.Namespace) -> int:
     return launch(state_dir=args.state_dir, demo=args.demo)
 
 
+def cmd_setup(args: argparse.Namespace) -> int:
+    from .paths import user_data_dir
+    from .setup import setup_queue, setup_status
+
+    state = args.state_dir or (
+        user_data_dir() / "state" if getattr(sys, "frozen", False) else Path("state")
+    )
+    try:
+        out = setup_status(state) if args.force_check else setup_queue(
+            state,
+            agents=[name.strip() for name in args.agents.split(",")] if args.agents is not None else None,
+            notifier=args.notifier,
+        )
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 1
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="hitl-queue", description=__doc__)
     p.add_argument("--state-dir", dest="global_state_dir", default=None)
@@ -110,6 +131,11 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("tray", help="Run the queue tray/menu-bar app")
     s.add_argument("--demo", action="store_true", help="Use only the neutral synthetic demo data")
     s.add_argument("--state-dir", default=None, help="Queue state directory")
+    s = sub.add_parser("setup", help="Create missing first-run configuration")
+    s.add_argument("--state-dir", default=None, help="Queue state directory")
+    s.add_argument("--agents", default=None, help="Comma-separated names (default: all example agents)")
+    s.add_argument("--notifier", default="stdout", help="Notification channel (default: stdout)")
+    s.add_argument("--force-check", action="store_true", help="Report setup status without writing")
     s = sub.add_parser("done")
     s.add_argument("id")
     s.add_argument("--actor", default="worker")
@@ -118,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("id")
 
     args = p.parse_args(argv)
-    if args.cmd in {"app", "tray"}:
+    if args.cmd in {"app", "tray", "setup"}:
         args.state_dir = args.state_dir or args.global_state_dir
     else:
         args.state_dir = args.global_state_dir or "state"
@@ -132,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_app(args)
     if args.cmd == "tray":
         return cmd_tray(args)
+    if args.cmd == "setup":
+        return cmd_setup(args)
 
     q = _q(args)
     try:

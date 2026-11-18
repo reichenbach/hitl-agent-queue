@@ -16,6 +16,11 @@
   header { display: flex; align-items: baseline; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
   header h1 { font-size: 15px; margin: 0; }
   header .sub { color: var(--muted); }
+  [hidden] { display: none !important; }
+  #setup-panel { margin: 24px auto; padding: 24px; max-width: 560px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  #setup-panel h2 { margin-top: 0; }
+  #setup-agents label { display: block; margin: 6px 0; }
+  #setup-panel select { font: inherit; padding: 5px; background: var(--card); color: var(--text); border: 1px solid var(--line); }
   #gate { padding: 9px 18px; font-weight: 500; border-bottom: 1px solid var(--line); }
   #gate.closed { background: rgba(245, 184, 77, .12); color: var(--warn); }
   #gate.open { background: rgba(62, 207, 142, .12); color: var(--ok); }
@@ -75,8 +80,21 @@
   <h1>HITL agent queue</h1>
   <span class="sub">__HITL_TITLE__</span>
 </header>
+<section id="setup-panel" hidden>
+  <h2>Set up your queue</h2>
+  <p>Choose the agents you use. Their CLIs or local model server must already be installed and signed in.</p>
+  <form id="setup-form">
+    <fieldset><legend>Agents</legend><div id="setup-agents"></div></fieldset>
+    <p><label for="setup-notifier">Notifier </label><select id="setup-notifier"></select></p>
+    <p id="setup-env"></p>
+    <p class="hint">Only the notifier name and its environment variable name are saved. Webhook URLs and API keys are never saved. HITL_NOTIFY overrides this choice. Board notifications stay in the local outbox.</p>
+    <p class="hint">Setup creates agents.toml and settings.json in this queue's state folder and a sibling workspace folder for agents. Existing files are kept.</p>
+    <p id="setup-error" role="alert"></p>
+    <button type="submit" id="setup-save">Save</button>
+  </form>
+</section>
 <div id="gate">Loading apply gate&hellip;</div>
-<main>
+<main id="queue-board">
   <div id="board-wrap">
     <div id="board"></div>
     <details id="side-lane">
@@ -93,6 +111,7 @@
 <script>
 const BOOT = /*__HITL_BOOT__*/null || { transport: "http", token: "" };
 let selectedId = null;
+let setupRendered = false;
 
 function ready() {
   if (BOOT.transport !== "pywebview") return Promise.resolve();
@@ -141,6 +160,48 @@ function renderGate(gate) {
   node.textContent = gate.open
     ? `Apply gate OPEN since ${gate.apply_opens} - approvals hand off in "apply" mode.`
     : `Apply gate CLOSED until ${gate.apply_opens} - approvals hand off in "review_only" mode (workers prepare, do not apply).`;
+}
+
+function renderSetup(setup) {
+  const needed = !!(setup && setup.needed);
+  document.getElementById("setup-panel").hidden = !needed;
+  document.getElementById("queue-board").hidden = needed;
+  document.getElementById("gate").hidden = needed;
+  if (!needed || setupRendered) return needed;
+  setupRendered = true;
+  const agents = document.getElementById("setup-agents");
+  agents.replaceChildren(...setup.agents.map((name) => el("label", {}, [
+    el("input", { type: "checkbox", value: name, checked: true }),
+    el("span", { text: ` ${name}` }),
+  ])));
+  const notifier = document.getElementById("setup-notifier");
+  notifier.replaceChildren(...setup.notifiers.map((n) => el("option", { value: n.name, text: n.name })));
+  const updateEnv = () => {
+    const env = setup.notifiers.find((n) => n.name === notifier.value).env;
+    document.getElementById("setup-env").textContent = env
+      ? `Set ${env} in the app's environment before sending notifications.`
+      : "stdout needs no credentials.";
+  };
+  notifier.addEventListener("change", updateEnv);
+  updateEnv();
+  document.getElementById("setup-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const save = document.getElementById("setup-save");
+    const error = document.getElementById("setup-error");
+    save.disabled = true;
+    error.textContent = "";
+    try {
+      const selected = [...agents.querySelectorAll("input:checked")].map((input) => input.value);
+      const result = await call("setup", selected, notifier.value);
+      if (!result.ok) throw new Error(result.error || "Setup failed");
+      await refresh();
+    } catch (err) {
+      error.textContent = err.message;
+    } finally {
+      save.disabled = false;
+    }
+  });
+  return needed;
 }
 
 function card(ticket) {
@@ -236,7 +297,7 @@ function renderNotifier(n) {
     el("h3", { text: "Notifier" }),
     el("dl", { class: "meta" }, [
       el("dt", { text: "Channel" }), el("dd", { text: "local outbox (never sends)" }),
-      el("dt", { text: "HITL_NOTIFY" }), el("dd", { text: `${n.configured} (ignored by board)` }),
+      el("dt", { text: "Queue channel" }), el("dd", { text: `${n.configured} (board uses outbox)` }),
       el("dt", { text: "State" }), el("dd", { text: n.muted ? "muted" : "live (to outbox)" }),
     ]),
     el("label", { class: "toggle" }, [toggle, el("span", { text: "Mute notifications" })]),
@@ -246,6 +307,7 @@ function renderNotifier(n) {
 
 async function refresh() {
   const board = await call("board");
+  if (renderSetup(board.setup)) return;
   renderGate(board.gate);
   renderBoard(board);
   renderNotifier(board.notifier);

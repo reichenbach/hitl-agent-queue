@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .paths import user_data_dir
+from .notify import get_notifier
 from .queue import Queue
+from .setup import agents_file, needs_setup
 from .text import sanitize_summary
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,8 @@ class TrayModel:
         on_change: Callable[[], object] | None = None,
     ) -> None:
         self.queue = queue
+        self.demo = demo
+        self._setup_loaded = not needs_setup(queue.state)
         self.app_launcher = app_launcher or (
             lambda: launch_desktop_app(state_dir=self.queue.state, demo=demo)
         )
@@ -73,6 +77,10 @@ class TrayModel:
     def refresh(self) -> tuple[TrayItem, ...]:
         """Re-read all state. Errors become a menu row instead of killing polling."""
         try:
+            if not self.demo and not self._setup_loaded and not needs_setup(self.queue.state):
+                self.queue.threads.configure_from(agents_file(self.queue.state))
+                self.queue.notifier = get_notifier(self.queue.state)
+                self._setup_loaded = True
             approvals = self._approval_items()
             running = self._running_items()
             usage = self._usage_items()
@@ -86,6 +94,8 @@ class TrayModel:
             TrayItem("Running agents", children=running or (self._empty("None"),)),
             TrayItem("Usage", children=usage or (self._empty("No usage plans"),)),
         ]
+        if not self.demo and needs_setup(self.queue.state):
+            sections.insert(0, TrayItem("Finish setup...", self.open_app))
         with self._lock:
             self._refresh_error = refresh_error
             errors = tuple(error for error in (self._action_error, refresh_error) if error)
@@ -328,9 +338,9 @@ def launch(*, state_dir: str | Path | None = None, demo: bool = False) -> int:
             frozen_dir / "state" if frozen_dir else Path("state")
         )
         queue = Queue(resolved_state)
-        agents_file = frozen_dir / "agents.toml" if frozen_dir else Path("agents.toml")
-        if agents_file.is_file():
-            queue.threads.configure_from(agents_file)
+        config = agents_file(resolved_state, data_dir=frozen_dir)
+        if config is not None:
+            queue.threads.configure_from(config)
     application = None
     try:
         application = TrayApplication(TrayModel(queue, demo=demo))

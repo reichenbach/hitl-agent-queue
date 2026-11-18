@@ -244,6 +244,45 @@ _BUILDERS = {
     "webhook": lambda: GenericWebhookNotifier(),
 }
 
+NOTIFIER_ENV = {
+    "stdout": None,
+    "cortland": "CORTLAND_IMESSAGE_CLI",
+    "slack": "HITL_SLACK_WEBHOOK_URL",
+    "teams": "HITL_TEAMS_WEBHOOK_URL",
+    "discord": "HITL_DISCORD_WEBHOOK_URL",
+    "webhook": "HITL_WEBHOOK_URL",
+}
+
+
+def notifier_name(state_dir: str | Path | None = None) -> str:
+    """Explicit environment selection wins over the saved first-run choice."""
+    mode = os.environ.get("HITL_NOTIFY")
+    if not mode and state_dir is not None:
+        mode = _saved_notifier(Path(state_dir) / "settings.json")
+    return (mode or "stdout").lower().strip()
+
+
+def _saved_notifier(settings: Path) -> str | None:
+    """A broken settings.json must not stop the queue; warn and use stdout."""
+    if not settings.is_file():
+        return None
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        logger.warning("Ignoring unreadable %s (%s); using stdout notifier", settings, exc)
+        return None
+    if not isinstance(data, dict):
+        logger.warning("Ignoring %s: expected a JSON object; using stdout notifier", settings)
+        return None
+    name = data.get("notifier")
+    if name is None:
+        return None
+    key = name.strip().lower() if isinstance(name, str) else None
+    if key not in _BUILDERS and key != "multi":
+        logger.warning("Ignoring unknown notifier %r in %s; using stdout notifier", name, settings)
+        return None
+    return key
+
 
 def build_notifier(name: str):
     key = name.strip().lower()
@@ -254,13 +293,13 @@ def build_notifier(name: str):
     return _BUILDERS[key]()
 
 
-def get_notifier():
+def get_notifier(state_dir: str | Path | None = None):
     """
     HITL_NOTIFY selects the channel:
       stdout (default) | cortland | slack | teams | discord | webhook
       multi  → HITL_NOTIFY_CHANNELS=stdout,slack,teams
     """
-    mode = (os.environ.get("HITL_NOTIFY") or "stdout").lower().strip()
+    mode = notifier_name(state_dir)
     if mode == "multi":
         names = [
             n.strip()

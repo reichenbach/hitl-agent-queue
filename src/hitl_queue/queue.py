@@ -74,7 +74,7 @@ class Queue:
         self.state = Path(state_dir).resolve()
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.cfg = config or dict(DEFAULT_CONFIG)
-        self.notifier = notifier or get_notifier()
+        self.notifier = notifier or get_notifier(self.state)
         self._connections = threading.local()
         self._connections_lock = threading.Lock()
         self._all_connections: set[sqlite3.Connection] = set()

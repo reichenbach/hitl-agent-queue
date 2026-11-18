@@ -245,6 +245,27 @@ class HttpFallbackTests(_DemoCase):
         self.assertEqual(out["action"], "handoff")
         self.assertEqual(self.queue.get(tid)["status"], "handoff")
 
+    def test_setup_uses_authenticated_bridge_and_returns_normal_board(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            os.chdir(tmp)  # keep the repo's tracked ./agents.toml out of the fallback
+            queue = OutboxQueue(Path(tmp) / "state")
+            try:
+                with mock.patch.object(self.api, "_queue", queue), \
+                        mock.patch.object(self.api, "_demo", False):
+                    self.assertEqual(self._post("setup", [["claude"], "stdout"])[0], 401)
+                    self.assertFalse((queue.state / "agents.toml").exists())
+                    code, result = self._post("setup", [["claude"], "stdout"], token=self.token)
+                    self.assertEqual(code, 200)
+                    self.assertTrue(result["ok"])
+                    code, board = self._post("board", token=self.token)
+                    self.assertEqual(code, 200)
+                    self.assertFalse(board["setup"]["needed"])
+                    self.assertEqual(board["usage"][0]["agent"], "claude")
+            finally:
+                queue.close()
+                os.chdir(old_cwd)
+
     def test_rejects_unknown_methods_bad_host_and_bad_args(self):
         self.assertEqual(self._post("_release_thread", token=self.token)[0], 404)
         self.assertEqual(
@@ -447,6 +468,24 @@ class RealAppTests(unittest.TestCase):
             self.assertEqual(len(queue.list(include_terminal=True)), 1)
         finally:
             queue.close()
+
+    def test_state_local_agents_take_precedence_and_setup_stays_complete_on_reopen(self):
+        from hitl_queue.setup import setup_queue
+
+        state = self.root / "state"
+        setup_queue(state, ["claude"], "teams")
+        # A legacy file must not replace the newly saved state-local selection.
+        (self.root / "agents.toml").write_text("invalid legacy TOML")
+
+        def check_board(api, **kwargs):
+            self.assertFalse(api.board()["setup"]["needed"])
+            self.assertEqual(api.usage()[0]["agent"], "claude")
+            self.assertEqual(api.notifier()["configured"], "teams")
+            return 0
+
+        with mock.patch.object(app, "_run_browser", side_effect=check_board), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(app.launch(state_dir=state, force_browser=True), 0)
 
     def test_source_and_frozen_defaults_and_config(self):
         for frozen, explicit in [(False, False), (False, True), (True, False), (True, True)]:

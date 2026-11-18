@@ -6,8 +6,8 @@ otherwise in the default browser via a localhost-only HTTP server.
 
 The app opens ``--state-dir`` or ``./state`` when run from source. Packaged
 builds default to ``state/`` in the shared per-user data directory. Real mode
-loads ``agents.toml`` from the working directory (the per-user data directory
-in packaged builds) and never seeds tickets. ``--demo`` instead uses a throwaway
+loads ``agents.toml`` from the state directory, with the legacy working/data
+directory as a fallback, and never seeds tickets. ``--demo`` instead uses a throwaway
 directory seeded with synthetic tickets and allows ``--apply-opens`` overrides.
 Buttons call ``Queue.actions``; notifications land in an in-memory outbox
 shown in the UI and are never sent anywhere in either mode.
@@ -19,7 +19,6 @@ import functools
 import html
 import json
 import logging
-import os
 import secrets
 import sys
 import tempfile
@@ -33,12 +32,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .paths import user_data_dir
+from .notify import notifier_name
 from .queue import DEFAULT_CONFIG, TRANSITIONS, Queue, apply_gate_open
+from .setup import agents_file, setup_queue, setup_status
 
 BOARD_STATUSES = ["new", "drafting", "review", "approved", "handoff", "done"]
 SIDE_LANE_STATUSES = ["blocked", "skipped", "cancelled"]
 APPROVABLE = {"new", "drafting", "review", "approved"}
-API_METHODS = ("board", "ticket", "approve", "skip", "set_mute", "usage")
+API_METHODS = ("board", "ticket", "approve", "skip", "set_mute", "usage", "setup")
 PREVIEW_BYTES = 4000
 MAX_BODY_BYTES = 1024 * 1024
 PAGE = Path(__file__).with_name("app.html")
@@ -181,6 +182,7 @@ class AppApi:
 
     def __init__(self, queue: OutboxQueue, *, demo: bool = False):
         self._queue = queue
+        self._demo = demo
         self._title = f"HITL Queue — {'demo data' if demo else queue.state}"
 
     @staticmethod
@@ -210,7 +212,20 @@ class AppApi:
             "gate": self.gate(),
             "notifier": self.notifier(),
             "usage": self.usage(),
+            "setup": None if self._demo else setup_status(self._queue.state),
         }
+
+    def setup(self, agents: list[str], notifier: str = "stdout") -> dict:
+        if self._demo:
+            return {"ok": False, "error": "Setup is unavailable in demo mode"}
+        try:
+            if not isinstance(agents, list) or not all(isinstance(name, str) for name in agents):
+                raise ValueError("agents must be a list of names")
+            result = setup_queue(self._queue.state, agents, notifier)
+            self._queue.threads.configure_from(agents_file(self._queue.state))
+            return result
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     def usage(self) -> list[dict]:
         """Small read-only API used by app clients."""
@@ -281,7 +296,7 @@ class AppApi:
         return {
             "channel": "outbox",
             "sends": False,
-            "configured": os.environ.get("HITL_NOTIFY") or "stdout",
+            "configured": notifier_name(self._queue.state),
             "muted": bool(self._queue.cfg.get("mute_notifications")),
             "outbox": self._queue.recent_notifications(),
         }
@@ -468,9 +483,9 @@ def launch(
             if demo:
                 seed_demo(queue)
             else:
-                agents_file = frozen_dir / "agents.toml" if frozen_dir else Path("agents.toml")
-                if agents_file.is_file():
-                    queue.threads.configure_from(agents_file)
+                config = agents_file(queue.state, data_dir=frozen_dir)
+                if config is not None:
+                    queue.threads.configure_from(config)
             webview = None if force_browser else _load_webview()
             if webview is not None:
                 opened = threading.Event()

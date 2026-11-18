@@ -13,8 +13,10 @@ app are on `main`. The board only showed throwaway demo data.
 2. **One bundle (done).** `make bundle` builds `HITL Queue` with the board and
    tray extras. Launch starts the tray; "Open app" runs the same frozen
    executable with `app --state-dir ...` to open the board directly.
-3. **First-run setup.** On an empty data dir, offer to create `agents.toml`
-   from the example and pick a notifier; no secrets stored in the bundle.
+3. **First-run setup (done).** The board offers agent and notifier choices;
+   the tray links to setup. Shared non-interactive `setup` creates missing
+   state-local configuration from the bundled example and sibling workspaces.
+   Settings store only notifier/environment variable names, never secrets.
 4. **Create and edit tickets from the board,** not only approve/skip.
 5. **Distribution.** App icon, codesigning and notarization for macOS, Windows
    installer, CI build artifacts. Needs Matt's decision on signing accounts.
