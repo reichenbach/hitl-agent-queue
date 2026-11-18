@@ -164,20 +164,27 @@ queue.threads.route("summarize changes", ["codex", "claude"])
 The router skips paused, killed, and quota-blocked agents, then chooses the
 greatest remaining quota headroom with agent-name tie breaking.
 
-## Desktop board (demo data)
+## Desktop board
 
 ```bash
 pip install -e ".[app]"          # optional: pywebview window
 python3 -m hitl_queue app        # falls back to your browser without pywebview
-python3 -m hitl_queue app --browser --apply-opens 2026-01-01
+python3 -m hitl_queue app --state-dir path/to/state
+python3 -m hitl_queue --state-dir path/to/state app   # either position works
+python3 -m hitl_queue app --demo
+python3 -m hitl_queue app --demo --browser --apply-opens 2026-01-01
 ```
 
-The app seeds synthetic tickets into a throwaway state dir (it ignores
-`--state-dir`). It shows one column per status, a collapsed
+By default, the board opens the real queue at `--state-dir` or `./state`
+when run from source, without adding demo tickets. Agents and plans load from
+`agents.toml` in the working directory, if present. `--demo` opts into synthetic
+tickets in a throwaway state dir and ignores `--state-dir`; `--apply-opens`
+is only accepted with `--demo`. The window title and page identify the state
+path or demo mode. The board shows one column per status, a collapsed
 blocked/skipped/cancelled lane, ticket files and status history, and the
 `apply_opens` gate. Approve and Skip buttons call `hitl_queue.actions`.
 Notifications go to a local outbox panel with a mute toggle and are never
-sent.
+sent in either mode. File previews only read files inside the state dir.
 
 ## Desktop app (macOS)
 
@@ -186,6 +193,16 @@ Build the standalone desktop app with the project-local virtualenv:
 ```bash
 make app
 open "dist/HITL Queue.app"
+```
+
+The packaged app opens the real queue in
+`~/Library/Application Support/HITL Queue/state/` by default, sharing it with
+the packaged tray app. It loads `agents.toml` from the same parent data folder.
+To select another queue or open a throwaway demo:
+
+```bash
+open "dist/HITL Queue.app" --args --state-dir path/to/state
+open "dist/HITL Queue.app" --args --demo
 ```
 
 The build is unsigned. The first time you launch it, right-click
@@ -209,7 +226,7 @@ The menu re-reads the queue every 5 seconds and after every action:
 | **Running agents** | Read-only rows `Agent — THR-ID (status)` for thread runs still `running` or `killing`. |
 | **Usage** | One read-only row per configured agent: a 10-cell bar of its highest used percentage across runs / minutes / tokens, e.g. `Alpha [####------] 40%`, with ` WARN` or ` BLOCKED` at the plan thresholds. |
 | `Error: …` | Appears only when reading state or the last action failed; polling keeps going. |
-| **Open app** | Starts the desktop board (`python3 -m hitl_queue app`, synthetic data) in a separate process. |
+| **Open app** | Starts the desktop board in a separate process with the tray's `--state-dir`; a demo tray passes `--demo` to open a separate throwaway demo board. |
 | **Refresh** / **Quit** | Re-read now / stop polling and remove the icon. |
 
 Empty sections show a disabled `None` (or `No usage plans`) row. Agents and

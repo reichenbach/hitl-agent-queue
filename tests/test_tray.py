@@ -1,6 +1,8 @@
 import unittest
 from unittest import mock
 import sys
+import runpy
+from pathlib import Path
 
 import hitl_queue.tray as tray
 from hitl_queue.cli import main
@@ -44,6 +46,7 @@ class FakeUsage:
 
 class FakeQueue:
     def __init__(self):
+        self.state = Path("queue-state").resolve()
         self.cfg = {"default_apply_worker": "codex"}
         self.tickets = [{"id": "TKT-0001", "title": "Review draft", "status": "review"}]
         self.payload = {"preferred_worker": "claude"}
@@ -99,6 +102,55 @@ class TrayModelTests(unittest.TestCase):
     def test_open_app_uses_injected_launcher(self):
         next(item for item in self.model.items if item.text == "Open app").action()
         self.assertEqual(self.launched, [True])
+
+    def test_open_app_command_uses_same_state_dir_and_demo_mode(self):
+        for frozen in (False, True):
+            for demo in (False, True):
+                with self.subTest(frozen=frozen, demo=demo), \
+                        mock.patch.object(sys, "frozen", frozen, create=True), \
+                        mock.patch.object(tray.subprocess, "Popen") as popen:
+                    model = TrayModel(self.queue, demo=demo)
+                    result = next(item for item in model.items if item.text == "Open app").action()
+                    command = [sys.executable, "app"] if frozen else [
+                        sys.executable, "-m", "hitl_queue", "app"
+                    ]
+                    command.extend(("--state-dir", str(self.queue.state)))
+                    if demo:
+                        command.append("--demo")
+                    popen.assert_called_once_with(command)
+                    self.assertIs(result, popen.return_value)
+
+    def test_tray_launch_passes_demo_mode_to_model(self):
+        for demo in (False, True):
+            with self.subTest(demo=demo), \
+                    mock.patch.object(tray, "Queue", return_value=self.queue), \
+                    mock.patch.object(tray, "TrayModel") as model, \
+                    mock.patch.object(tray, "TrayApplication") as application, \
+                    mock.patch.object(self.queue.threads, "configure_from", create=True), \
+                    mock.patch("hitl_queue.app.seed_demo"), \
+                    mock.patch("hitl_queue.app.OutboxQueue", return_value=self.queue):
+                self.queue.close = mock.Mock()
+                application.return_value.poll_thread = None
+                self.assertEqual(tray.launch(state_dir="queue-state", demo=demo), 0)
+                model.assert_called_once_with(self.queue, demo=demo)
+
+    def test_frozen_open_app_command_routes_through_packaged_launcher(self):
+        launcher = Path(__file__).resolve().parents[1] / "packaging/hitl_tray_launcher.py"
+        for demo in (False, True):
+            with self.subTest(demo=demo), \
+                    mock.patch.object(sys, "frozen", True, create=True), \
+                    mock.patch.object(tray.subprocess, "Popen") as popen:
+                tray.launch_desktop_app(state_dir=self.queue.state, demo=demo)
+                command = popen.call_args.args[0]
+                with mock.patch.object(sys, "argv", command), \
+                        mock.patch("hitl_queue.app.launch", return_value=0) as launch:
+                    with self.assertRaises(SystemExit) as raised:
+                        runpy.run_path(str(launcher), run_name="__main__")
+                self.assertEqual(raised.exception.code, 0)
+                launch.assert_called_once_with(
+                    state_dir=str(self.queue.state), demo=demo,
+                    force_browser=False, port=0, apply_opens=None,
+                )
 
     def test_ticket_title_is_single_line_bounded_and_strips_bidi_controls(self):
         self.queue.tickets[0]["title"] = "  Review\nthis\u0085\u202e " + "x" * 80

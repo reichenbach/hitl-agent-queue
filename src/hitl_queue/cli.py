@@ -56,6 +56,8 @@ def cmd_app(args: argparse.Namespace) -> int:
     from .app import launch
 
     return launch(
+        state_dir=args.state_dir,
+        demo=args.demo,
         force_browser=args.browser,
         port=args.port,
         apply_opens=args.apply_opens,
@@ -98,8 +100,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--port", type=int, default=8787)
     s = sub.add_parser(
         "app",
-        help="Open the demo review board (pywebview window, or browser fallback)",
+        help="Open the queue review board (pywebview window, or browser fallback)",
     )
+    s.add_argument("--state-dir", default=None, help="Queue state directory")
+    s.add_argument("--demo", action="store_true", help="Use only the neutral synthetic demo data")
     s.add_argument("--browser", action="store_true", help="Skip pywebview; use the browser")
     s.add_argument("--port", type=int, default=0, help="Browser fallback port (default: random)")
     s.add_argument("--apply-opens", default=None, help="Override demo apply_opens (YYYY-MM-DD)")
@@ -114,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("id")
 
     args = p.parse_args(argv)
-    if args.cmd == "tray":
+    if args.cmd in {"app", "tray"}:
         args.state_dir = args.state_dir or args.global_state_dir
     else:
         args.state_dir = args.global_state_dir or "state"
@@ -123,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "reply-server":
         return cmd_reply_server(args)
     if args.cmd == "app":
+        if args.apply_opens is not None and not args.demo:
+            p.error("app --apply-opens requires --demo")
         return cmd_app(args)
     if args.cmd == "tray":
         return cmd_tray(args)
