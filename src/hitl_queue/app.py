@@ -34,7 +34,7 @@ from pathlib import Path
 from .paths import user_data_dir
 from .notify import notifier_name
 from .queue import DEFAULT_CONFIG, KINDS, TRANSITIONS, Queue, apply_gate_open
-from .setup import setup_queue, setup_status
+from .setup import agents_file, setup_queue, setup_status
 
 BOARD_STATUSES = ["new", "drafting", "review", "approved", "handoff", "done"]
 SIDE_LANE_STATUSES = ["blocked", "skipped", "cancelled"]
@@ -226,7 +226,7 @@ class AppApi:
             if not isinstance(agents, list) or not all(isinstance(name, str) for name in agents):
                 raise ValueError("agents must be a list of names")
             result = setup_queue(self._queue.state, agents, notifier)
-            self._queue.threads.configure_from(self._queue.state / "agents.toml")
+            self._queue.threads.configure_from(agents_file(self._queue.state))
             return result
         except (ValueError, OSError) as exc:
             return {"ok": False, "error": str(exc)}
@@ -500,11 +500,9 @@ def launch(
             if demo:
                 seed_demo(queue)
             else:
-                agents_file = queue.state / "agents.toml"
-                if not agents_file.is_file():
-                    agents_file = frozen_dir / "agents.toml" if frozen_dir else Path("agents.toml")
-                if agents_file.is_file():
-                    queue.threads.configure_from(agents_file)
+                config = agents_file(queue.state, data_dir=frozen_dir)
+                if config is not None:
+                    queue.threads.configure_from(config)
             webview = None if force_browser else _load_webview()
             if webview is not None:
                 opened = threading.Event()

@@ -357,6 +357,8 @@ class HttpFallbackTests(_TicketEndpoints, _DemoCase):
 
     def test_setup_uses_authenticated_bridge_and_returns_normal_board(self):
         with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            os.chdir(tmp)  # keep the repo's tracked ./agents.toml out of the fallback
             queue = OutboxQueue(Path(tmp) / "state")
             try:
                 with mock.patch.object(self.api, "_queue", queue), \
@@ -372,6 +374,7 @@ class HttpFallbackTests(_TicketEndpoints, _DemoCase):
                     self.assertEqual(board["usage"][0]["agent"], "claude")
             finally:
                 queue.close()
+                os.chdir(old_cwd)
 
     def test_rejects_unknown_methods_bad_host_and_bad_args(self):
         self.assertEqual(self._post("_release_thread", token=self.token)[0], 404)
